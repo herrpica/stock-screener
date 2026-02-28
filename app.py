@@ -163,6 +163,31 @@ with st.sidebar:
 
     st.divider()
 
+    # Stock search — available on every page
+    if st.session_state.data_loaded and st.session_state.all_data:
+        all_tickers = sorted(st.session_state.all_data.keys())
+        # Build display list: "AAPL — Apple Inc."
+        ticker_labels = []
+        for t in all_tickers:
+            comp = st.session_state.all_data[t].get(
+                "company", st.session_state.all_data[t].get("info", {}).get("shortName", "")
+            )
+            ticker_labels.append(f"{t} — {comp}" if comp else t)
+        search_pick = st.selectbox(
+            "🔍 Search stock",
+            options=range(len(all_tickers)),
+            format_func=lambda i: ticker_labels[i],
+            index=None,
+            key="sidebar_search",
+            placeholder="Ticker or company name...",
+        )
+        if search_pick is not None:
+            st.session_state.selected_ticker = all_tickers[search_pick]
+            st.session_state.page = "Stock Detail"
+            st.rerun()
+
+    st.divider()
+
     page = st.radio(
         "Navigation",
         PAGES,
