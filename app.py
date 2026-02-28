@@ -69,6 +69,7 @@ def _init_state():
         "deep_dive_cache": {},
         "dd_running": False,
         "dd_progress_step": 0,
+        "session_api_cost": 0.0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -253,6 +254,23 @@ with st.sidebar:
     st.divider()
     if st.session_state.data_loaded and st.session_state.all_data:
         st.caption(f"{len(st.session_state.all_data)} stocks loaded")
+
+    st.divider()
+    cost = st.session_state.session_api_cost
+    st.caption(f"Session API cost: ~${cost:.2f}")
+
+
+# ── Cost tracking helper ────────────────────────────────────────────────────
+
+_API_COSTS = {
+    "sec_analysis": 0.02,
+    "deep_dive": 0.10,
+    "scenario": 0.03,
+}
+
+def _track_cost(call_type: str, count: int = 1):
+    """Add estimated API cost to the session total."""
+    st.session_state.session_api_cost += _API_COSTS[call_type] * count
 
 
 # ── Load data on first run ──────────────────────────────────────────────────
@@ -656,6 +674,7 @@ elif st.session_state.page == "Stock Detail":
         if "error" in dd_result:
             st.error(dd_result["error"])
         else:
+            _track_cost("deep_dive")
             st.session_state.deep_dive_cache[ticker] = dd_result
             st.rerun()
 
@@ -953,6 +972,7 @@ elif st.session_state.page == "Stock Detail":
                 with st.spinner(f"Fetching SEC filings and running AI analysis for {ticker}..."):
                     sec_result = get_full_sec_analysis(ticker, api_key)
                     st.session_state.sec_cache[ticker] = sec_result
+                    _track_cost("sec_analysis")
 
             sec_data = st.session_state.sec_cache.get(ticker)
             if sec_data:
@@ -1549,6 +1569,7 @@ elif st.session_state.page == "Scenario Analysis":
             result = analyze_scenario(scenario_text, master, api_key)
 
         if result and "error" not in result:
+            _track_cost("scenario")
             st.session_state.scenario_result = result
             # Save to history
             st.session_state.scenario_history.append({
@@ -1716,6 +1737,7 @@ elif st.session_state.page == "SEC Intelligence":
         with st.spinner(f"Running full SEC analysis for {sec_ticker}... (this may take 1-2 minutes)"):
             sec_result = get_full_sec_analysis(sec_ticker, api_key)
             st.session_state.sec_cache[sec_ticker] = sec_result
+            _track_cost("sec_analysis")
 
     # Show cached results
     sec_data = st.session_state.sec_cache.get(sec_ticker) if sec_ticker else None
@@ -1954,6 +1976,7 @@ elif st.session_state.page == "SEC Intelligence":
                 )
                 sec_result = get_full_sec_analysis(t, api_key)
                 st.session_state.sec_cache[t] = sec_result
+                _track_cost("sec_analysis")
             else:
                 progress.progress(
                     (i + 1) / len(batch_options),
