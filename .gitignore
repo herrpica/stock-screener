@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.cache/
+.env
+.streamlit/secrets.toml
+*.pkl
+*.bak
+.claude/
