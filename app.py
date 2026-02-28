@@ -27,6 +27,10 @@ from scenario_engine import (
     analyze_scenario, apply_scenario_to_valuations, PRESET_SCENARIOS,
 )
 from sec_fetcher import get_full_sec_analysis, get_recent_filings
+from deep_dive_engine import (
+    run_deep_dive, fetch_all_documents, estimate_deep_dive_cost,
+    load_cached_deep_dive, STEPS as DD_STEPS,
+)
 
 # ── App config ──────────────────────────────────────────────────────────────
 
@@ -62,6 +66,9 @@ def _init_state():
         "discount_rate": 10,
         "data_loaded": False,
         "sec_cache": {},
+        "deep_dive_cache": {},
+        "dd_running": False,
+        "dd_progress_step": 0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -289,6 +296,28 @@ def _sec_flag_badge(flag):
     return "⚫"
 
 
+def _rec_badge(rec):
+    """Colored recommendation badge for deep dive."""
+    colors = {
+        "Strong Buy": ("🟢", "#27ae60"),
+        "Buy": ("🟢", "#2ecc71"),
+        "Hold": ("🟡", "#f39c12"),
+        "Avoid": ("🔴", "#e74c3c"),
+        "Strong Avoid": ("🔴", "#c0392b"),
+    }
+    icon, color = colors.get(rec, ("⚫", "gray"))
+    return f'{icon} <span style="color:{color};font-weight:bold;font-size:1.1em">{rec}</span>'
+
+
+def _delta_arrow(delta):
+    """Return colored arrow for delta values."""
+    if delta > 0:
+        return f'<span style="color:#27ae60">+{delta:.1f} ↑</span>'
+    elif delta < 0:
+        return f'<span style="color:#e74c3c">{delta:.1f} ↓</span>'
+    return '<span style="color:gray">0 →</span>'
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # PAGE 1: SCREENER
 # ═════════════════════════════════════════════════════════════════════════════
@@ -312,7 +341,7 @@ if st.session_state.page == "Screener":
     st.header("S&P 500 Stock Screener")
 
     # Quick filter buttons
-    qf_cols = st.columns(5)
+    qf_cols = st.columns(6)
     with qf_cols[0]:
         show_all = st.button("All Stocks", use_container_width=True)
     with qf_cols[1]:
@@ -326,6 +355,9 @@ if st.session_state.page == "Screener":
     with qf_cols[4]:
         show_ai = st.button("AI Opportunity", use_container_width=True,
                             help="Tech + AI-exposed stocks with strong scores")
+    with qf_cols[5]:
+        show_dd_buy = st.button("DD Buy/Strong Buy", use_container_width=True,
+                                help="Deep Dive recommendation: Buy or Strong Buy")
 
     # Determine active filter
     if "quick_filter" not in st.session_state:
@@ -341,6 +373,8 @@ if st.session_state.page == "Screener":
         st.session_state.quick_filter = "under"
     elif show_ai:
         st.session_state.quick_filter = "ai"
+    elif show_dd_buy:
+        st.session_state.quick_filter = "dd_buy"
 
     # Filter sidebar
     with st.expander("Filters", expanded=False):
@@ -363,9 +397,19 @@ if st.session_state.page == "Screener":
         with fc4:
             min_score = st.slider("Min Composite Score", 0, 100, 0,
                                   key="filter_score")
+        dd_only = st.checkbox("Deep Dive analyzed only", key="filter_dd_only")
 
     # Apply filters
     df = master.copy()
+
+    # Attach deep dive data to df
+    dd_cache = st.session_state.deep_dive_cache
+    dd_recs = {}
+    for t, dd in dd_cache.items():
+        thesis = dd.get("investment_thesis", {})
+        dd_recs[t] = thesis.get("recommendation", "")
+    df["dd_rec"] = df["ticker"].map(dd_recs).fillna("")
+    df["has_dd"] = df["dd_rec"] != ""
 
     # Use scenario-adjusted values if active
     if st.session_state.scenario_active and st.session_state.scenario_df is not None:
@@ -385,6 +429,8 @@ if st.session_state.page == "Screener":
 
     df = df[df[mos_col].fillna(-999) >= min_mos]
     df = df[df["composite_score"].fillna(0) >= min_score]
+    if dd_only:
+        df = df[df["has_dd"]]
 
     # Quick filter overrides
     qf = st.session_state.quick_filter
@@ -397,6 +443,8 @@ if st.session_state.page == "Screener":
     elif qf == "ai":
         ai_sectors = ["Information Technology", "Communication Services"]
         df = df[df["sector"].isin(ai_sectors) & (df["composite_score"].fillna(0) >= 50)]
+    elif qf == "dd_buy":
+        df = df[df["dd_rec"].isin(["Buy", "Strong Buy"])]
 
     # Build display table
     display_cols = ["ticker", "company", "sector", "current_price"]
@@ -409,6 +457,11 @@ if st.session_state.page == "Screener":
         df["display_iv"] = df["intrinsic_value"]
         df["display_mos"] = df["margin_of_safety"]
         display_cols += ["display_iv", "display_mos"]
+
+    # Add deep dive rec column if any exist
+    has_any_dd = df["has_dd"].any()
+    if has_any_dd:
+        display_cols += ["dd_rec"]
 
     display_cols += [
         "quality_rating", "composite_score", "sector_rank",
@@ -426,6 +479,7 @@ if st.session_state.page == "Screener":
         "growth_score": "G",
         "value_score": "V",
         "sentiment_score": "S",
+        "dd_rec": "Deep Dive",
     }
     if "scenario_multiplier_applied" in display_cols:
         rename_map["scenario_multiplier_applied"] = "Scenario"
@@ -528,10 +582,94 @@ elif st.session_state.page == "Stock Detail":
 
     st.markdown(f"**Quality Rating:** {_rating_badge(rating)}")
 
+    # ── Deep Dive Button ─────────────────────────────────────────
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    dd_result = st.session_state.deep_dive_cache.get(ticker)
+    # Also check file cache
+    if not dd_result:
+        dd_result = load_cached_deep_dive(ticker)
+        if dd_result:
+            st.session_state.deep_dive_cache[ticker] = dd_result
+
+    dd_col1, dd_col2 = st.columns([3, 2])
+    with dd_col1:
+        if dd_result and "error" not in dd_result:
+            ts = dd_result.get("analysis_timestamp", "")
+            rec = dd_result.get("investment_thesis", {}).get("recommendation", "N/A")
+            st.markdown(
+                f"**Deep Dive:** {_rec_badge(rec)} — analyzed {ts[:10]}",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.caption(f"{estimate_deep_dive_cost()} | ~60-90 seconds")
+    with dd_col2:
+        if dd_result and "error" not in dd_result:
+            dd_refresh = st.button("🔄 Refresh Deep Dive", key="dd_refresh")
+        else:
+            dd_refresh = False
+        dd_run = st.button("🔬 Run Deep Dive Analysis", type="primary",
+                           disabled=not api_key, key="dd_run")
+
+    if dd_run or dd_refresh:
+        progress_bar = st.progress(0, text="Starting deep dive analysis...")
+        status_text = st.empty()
+
+        def _dd_progress(step_idx, step_label):
+            frac = (step_idx + 1) / len(DD_STEPS)
+            progress_bar.progress(frac, text=f"Step {step_idx + 1}/{len(DD_STEPS)}: {step_label}...")
+            status_text.text(f"Step {step_idx + 1}/{len(DD_STEPS)}: {step_label}")
+
+        # Build inputs for deep dive
+        scores_dict = {}
+        if row is not None:
+            scores_dict = {
+                "quality_score": row.get("quality_score", 50),
+                "growth_score": row.get("growth_score", 50),
+                "value_score": row.get("value_score", 50),
+                "sentiment_score": row.get("sentiment_score", 50),
+                "composite_score": row.get("composite_score", 50),
+            }
+
+        ratings_df = st.session_state.ratings_df
+        qr_dict = {}
+        if ratings_df is not None:
+            rr_rows = ratings_df[ratings_df["ticker"] == ticker]
+            if not rr_rows.empty:
+                qr_dict = rr_rows.iloc[0].to_dict()
+
+        dd_result = run_deep_dive(
+            ticker=ticker,
+            company_name=company,
+            current_scores=scores_dict,
+            current_valuation=val,
+            current_quality_rating=qr_dict,
+            sector=sector,
+            sector_medians={},
+            api_key=api_key,
+            discount_rate=st.session_state.discount_rate / 100,
+            on_progress=_dd_progress,
+            force_refresh=dd_refresh,
+        )
+        progress_bar.empty()
+        status_text.empty()
+
+        if "error" in dd_result:
+            st.error(dd_result["error"])
+        else:
+            st.session_state.deep_dive_cache[ticker] = dd_result
+            st.rerun()
+
     # ── Tabbed Detail View ──────────────────────────────────────────
-    tab_val, tab_scores, tab_quality, tab_sec, tab_raw = st.tabs([
-        "Valuation", "Scores", "Quality Rating", "SEC Intelligence", "Raw Data"
-    ])
+    tab_names = ["Valuation", "Scores", "Quality Rating", "SEC Intelligence", "Raw Data"]
+    if dd_result and "error" not in dd_result:
+        tab_names.append("Deep Dive")
+    tabs = st.tabs(tab_names)
+    tab_val = tabs[0]
+    tab_scores = tabs[1]
+    tab_quality = tabs[2]
+    tab_sec = tabs[3]
+    tab_raw = tabs[4]
+    tab_dd = tabs[5] if len(tabs) > 5 else None
 
     # ── TAB: Valuation ──────────────────────────────────────────────
     with tab_val:
@@ -801,15 +939,9 @@ elif st.session_state.page == "Stock Detail":
 
     # ── TAB: SEC Intelligence ───────────────────────────────────────
     with tab_sec:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             st.warning("Set ANTHROPIC_API_KEY in .env to enable SEC analysis.")
         else:
-            cached_sec = st.session_state.sec_cache.get(ticker)
-
-            if cached_sec:
-                _render_sec_analysis(ticker, cached_sec) if False else None
-
             col_a, col_b = st.columns([3, 1])
             with col_a:
                 st.subheader(f"SEC Filing Analysis — {ticker}")
@@ -951,6 +1083,354 @@ elif st.session_state.page == "Stock Detail":
         if cashflow is not None and not cashflow.empty:
             with st.expander("Cash Flow"):
                 st.dataframe(cashflow, use_container_width=True)
+
+    # ── TAB: Deep Dive (only if results exist) ────────────────────
+    if tab_dd is not None and dd_result and "error" not in dd_result:
+        with tab_dd:
+            thesis = dd_result.get("investment_thesis", {})
+            biz = dd_result.get("business_assessment", {})
+            recon = dd_result.get("metric_reconciliation", {})
+            fwd = dd_result.get("forward_analysis", {})
+            adj_scores = dd_result.get("adjusted_scores", {})
+            adj_val = dd_result.get("adjusted_valuation", {})
+
+            # ── Section 1: Investment Thesis ───────────────────────
+            st.markdown("---")
+            rec = thesis.get("recommendation", "N/A")
+            conviction = thesis.get("conviction_level", "N/A")
+            one_liner = thesis.get("one_line_thesis", "")
+
+            st.markdown(f"### {_rec_badge(rec)}", unsafe_allow_html=True)
+            st.markdown(f"**Conviction:** {conviction.upper()}")
+            st.markdown(f"*{one_liner}*")
+
+            memo = thesis.get("memo_summary", "")
+            if memo:
+                st.container(border=True).markdown(memo)
+
+            # ── Section 2: Bull | Base | Bear ─────────────────────
+            st.markdown("---")
+            st.subheader("Scenario Analysis")
+            bull_col, base_col, bear_col = st.columns(3)
+
+            bull = thesis.get("bull_case", {})
+            base_case = thesis.get("base_case", {})
+            bear = thesis.get("bear_case", {})
+
+            with bull_col:
+                st.markdown("#### 🟢 Bull Case")
+                upside = bull.get("upside_to_intrinsic_value_pct")
+                if upside is not None:
+                    st.metric("Upside", f"+{upside:.0f}%")
+                st.markdown(bull.get("narrative", ""))
+                assumptions = bull.get("key_assumptions", [])
+                if assumptions:
+                    st.markdown("**Key Assumptions:**")
+                    for a in assumptions:
+                        st.markdown(f"- {a}")
+
+            with base_col:
+                st.markdown("#### 🟡 Base Case")
+                exp_ret = base_case.get("expected_return_12_month_pct")
+                if exp_ret is not None:
+                    st.metric("12m Expected Return", f"{exp_ret:+.0f}%")
+                st.markdown(base_case.get("narrative", ""))
+                assumptions = base_case.get("key_assumptions", [])
+                if assumptions:
+                    st.markdown("**Key Assumptions:**")
+                    for a in assumptions:
+                        st.markdown(f"- {a}")
+
+            with bear_col:
+                st.markdown("#### 🔴 Bear Case")
+                downside = bear.get("downside_pct")
+                if downside is not None:
+                    st.metric("Downside", f"-{abs(downside):.0f}%")
+                st.markdown(bear.get("narrative", ""))
+                risks = bear.get("key_risks", [])
+                if risks:
+                    st.markdown("**Key Risks:**")
+                    for r in risks:
+                        st.markdown(f"- {r}")
+
+            # ── Section 3: Adjusted Metrics ───────────────────────
+            st.markdown("---")
+            st.subheader("Adjusted Metrics")
+
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            with mc1:
+                q_delta = adj_scores.get("quality_score_delta", 0)
+                st.metric("Quality", f"{adj_scores.get('quality_score', 'N/A')}",
+                          delta=f"{q_delta:+.1f}" if q_delta else None)
+            with mc2:
+                g_delta = adj_scores.get("growth_score_delta", 0)
+                st.metric("Growth", f"{adj_scores.get('growth_score', 'N/A')}",
+                          delta=f"{g_delta:+.1f}" if g_delta else None)
+            with mc3:
+                v_delta = adj_scores.get("value_score_delta", 0)
+                st.metric("Value", f"{adj_scores.get('value_score', 'N/A')}",
+                          delta=f"{v_delta:+.1f}" if v_delta else None)
+            with mc4:
+                s_delta = adj_scores.get("sentiment_score_delta", 0)
+                st.metric("Sentiment", f"{adj_scores.get('sentiment_score', 'N/A')}",
+                          delta=f"{s_delta:+.1f}" if s_delta else None)
+
+            vc1, vc2, vc3 = st.columns(3)
+            with vc1:
+                iv_delta = adj_val.get("intrinsic_value_delta", 0)
+                st.metric("Adj. Intrinsic Value",
+                          f"${adj_val.get('intrinsic_value', 0):.2f}",
+                          delta=f"${iv_delta:+.2f}" if iv_delta else None)
+            with vc2:
+                mos_delta = adj_val.get("margin_of_safety_delta", 0)
+                st.metric("Adj. Margin of Safety",
+                          f"{adj_val.get('margin_of_safety', 0):.1f}%",
+                          delta=f"{mos_delta:+.1f}%" if mos_delta else None)
+            with vc3:
+                orig_rating = dd_result.get("original_quality_rating", "N/A")
+                adj_rating = dd_result.get("adjusted_quality_rating", orig_rating)
+                changed = adj_rating != orig_rating
+                st.metric("Quality Rating", adj_rating,
+                          delta=f"was {orig_rating}" if changed else None)
+
+            # What changed and why
+            with st.expander("What changed and why"):
+                adj_detail = recon.get("score_adjustments", {})
+                adj_rows = []
+                for pillar in ["quality_score", "growth_score", "value_score", "sentiment_score"]:
+                    pa = adj_detail.get(pillar, {})
+                    adj_rows.append({
+                        "Pillar": pillar.replace("_score", "").title(),
+                        "Adjustment": pa.get("adjustment", 0),
+                        "Reasoning": pa.get("reasoning", "N/A"),
+                    })
+                iv_detail = recon.get("intrinsic_value_adjustments", {})
+                adj_rows.append({
+                    "Pillar": "Growth Rate",
+                    "Adjustment": f"{iv_detail.get('growth_rate_adjustment', 0):+.2%}",
+                    "Reasoning": iv_detail.get("reasoning", "N/A"),
+                })
+                adj_rows.append({
+                    "Pillar": "EPS Base",
+                    "Adjustment": f"{iv_detail.get('earnings_base_adjustment_pct', 0):+.0%}",
+                    "Reasoning": iv_detail.get("earnings_base_reasoning", "N/A"),
+                })
+                adj_rows.append({
+                    "Pillar": "Discount Rate",
+                    "Adjustment": f"{iv_detail.get('discount_rate_adjustment', 0):+.2%}",
+                    "Reasoning": iv_detail.get("discount_rate_reasoning", "N/A"),
+                })
+                st.dataframe(pd.DataFrame(adj_rows), hide_index=True, use_container_width=True)
+
+            # ── Section 4: Business Quality ───────────────────────
+            st.markdown("---")
+            st.subheader("Business Quality Deep Dive")
+
+            bq1, bq2, bq3 = st.columns(3)
+            with bq1:
+                moat = biz.get("competitive_moat_assessment", {})
+                st.container(border=True).markdown(
+                    f"**Competitive Moat**\n\n"
+                    f"Exists: {'Yes' if moat.get('moat_exists') else 'No'}\n\n"
+                    f"Type: {moat.get('moat_type', 'N/A')}\n\n"
+                    f"Durability: {moat.get('moat_durability', 'N/A')}\n\n"
+                    f"{moat.get('evidence', '')}"
+                )
+            with bq2:
+                rev_q = biz.get("revenue_quality", {})
+                rec_pct = rev_q.get("recurring_revenue_pct_estimate")
+                st.container(border=True).markdown(
+                    f"**Revenue Quality: {rev_q.get('score', 'N/A')}/100**\n\n"
+                    f"Recurring Revenue: {f'{rec_pct:.0%}' if rec_pct else 'N/A'}\n\n"
+                    f"Concentration Risk: {rev_q.get('revenue_concentration_risk', 'N/A')}\n\n"
+                    f"{rev_q.get('notes', '')}"
+                )
+            with bq3:
+                earn_q = biz.get("earnings_quality", {})
+                st.container(border=True).markdown(
+                    f"**Earnings Quality: {earn_q.get('score', 'N/A')}/100**\n\n"
+                    f"GAAP vs Reality: {earn_q.get('gaap_vs_reality_gap', 'N/A')}\n\n"
+                    f"One-time Items: {'Yes' if earn_q.get('one_time_items_detected') else 'No'}\n\n"
+                    f"{earn_q.get('one_time_item_details', '')}"
+                )
+
+            bq4, bq5 = st.columns(2)
+            with bq4:
+                cap_alloc = biz.get("capital_allocation_quality", {})
+                st.container(border=True).markdown(
+                    f"**Capital Allocation: {cap_alloc.get('score', 'N/A')}/100**\n\n"
+                    f"Primary Use: {cap_alloc.get('primary_use_of_capital', 'N/A')}\n\n"
+                    f"{cap_alloc.get('assessment', '')}"
+                )
+            with bq5:
+                ai_pos = biz.get("ai_and_technology_position", {})
+                opp = "Yes" if ai_pos.get("ai_as_opportunity") else "No"
+                threat = "Yes" if ai_pos.get("ai_as_threat") else "No"
+                initiatives = ai_pos.get("company_ai_initiatives", [])
+                st.container(border=True).markdown(
+                    f"**AI & Technology Position**\n\n"
+                    f"AI Opportunity: {opp} | AI Threat: {threat}\n\n"
+                    f"Disruption Risk: {ai_pos.get('disruption_risk_level', 'N/A')} "
+                    f"({ai_pos.get('disruption_timeline', 'N/A')})\n\n"
+                    + ("\n".join(f"- {i}" for i in initiatives) if initiatives else "No specific initiatives noted")
+                )
+
+            # Hidden strengths/weaknesses
+            strengths = biz.get("hidden_strengths", [])
+            weaknesses = biz.get("hidden_weaknesses", [])
+            if strengths or weaknesses:
+                sw1, sw2 = st.columns(2)
+                with sw1:
+                    if strengths:
+                        st.markdown("**Hidden Strengths:**")
+                        for s in strengths:
+                            st.markdown(f"- 🟢 {s}")
+                with sw2:
+                    if weaknesses:
+                        st.markdown("**Hidden Weaknesses:**")
+                        for w in weaknesses:
+                            st.markdown(f"- 🔴 {w}")
+
+            # ── Section 5: Forward Analysis ───────────────────────
+            st.markdown("---")
+            st.subheader("Forward Analysis")
+
+            fa1, fa2, fa3 = st.columns(3)
+            with fa1:
+                margin_t = fwd.get("margin_trajectory", {})
+                st.metric("Margin Trajectory", margin_t.get("direction", "N/A"))
+                st.caption(margin_t.get("reasoning", ""))
+            with fa2:
+                rev_t = fwd.get("revenue_trajectory", {})
+                st.metric("Revenue Trajectory", rev_t.get("direction", "N/A"))
+                st.caption(rev_t.get("reasoning", ""))
+            with fa3:
+                st.metric("Competitive Position", fwd.get("competitive_position_trend", "N/A"))
+                st.caption(fwd.get("competitive_position_evidence", ""))
+
+            # Three-year earnings power
+            ep = fwd.get("three_year_earnings_power_estimate", {})
+            if ep:
+                st.markdown("**Three-Year Earnings Power:**")
+                ep1, ep2, ep3 = st.columns(3)
+                with ep1:
+                    base_gr = ep.get("base_case_growth_rate")
+                    st.metric("Base Case Growth", f"{base_gr:.1%}" if base_gr is not None else "N/A")
+                with ep2:
+                    bull_gr = ep.get("bull_case_growth_rate")
+                    st.metric("Bull Case Growth", f"{bull_gr:.1%}" if bull_gr is not None else "N/A")
+                with ep3:
+                    bear_gr = ep.get("bear_case_growth_rate")
+                    st.metric("Bear Case Growth", f"{bear_gr:.1%}" if bear_gr is not None else "N/A")
+
+            # Catalysts and headwinds
+            catalysts = fwd.get("growth_catalysts", [])
+            headwinds = fwd.get("growth_headwinds", [])
+
+            cat_hw = st.columns(2)
+            with cat_hw[0]:
+                if catalysts:
+                    st.markdown("**Growth Catalysts:**")
+                    cat_rows = []
+                    for c in catalysts:
+                        cat_rows.append({
+                            "Catalyst": c.get("catalyst", ""),
+                            "Timeline": c.get("timeline", ""),
+                            "Magnitude": c.get("magnitude", ""),
+                            "Confidence": c.get("management_confidence_level", ""),
+                        })
+                    st.dataframe(pd.DataFrame(cat_rows), hide_index=True, use_container_width=True)
+
+            with cat_hw[1]:
+                if headwinds:
+                    st.markdown("**Growth Headwinds:**")
+                    hw_rows = []
+                    for h in headwinds:
+                        hw_rows.append({
+                            "Headwind": h.get("headwind", ""),
+                            "Timeline": h.get("timeline", ""),
+                            "Magnitude": h.get("magnitude", ""),
+                        })
+                    st.dataframe(pd.DataFrame(hw_rows), hide_index=True, use_container_width=True)
+
+            # Industry tailwinds/headwinds
+            tail = fwd.get("industry_tailwinds", [])
+            head = fwd.get("industry_headwinds", [])
+            if tail or head:
+                iw1, iw2 = st.columns(2)
+                with iw1:
+                    if tail:
+                        st.markdown("**Industry Tailwinds:**")
+                        for t in tail:
+                            st.markdown(f"- 🌊 {t}")
+                with iw2:
+                    if head:
+                        st.markdown("**Industry Headwinds:**")
+                        for h in head:
+                            st.markdown(f"- 🧱 {h}")
+
+            # ── Section 6: Red Flags & Positive Revisions ─────────
+            st.markdown("---")
+            st.subheader("Red Flags & Positive Revisions")
+
+            flags_col, pos_col = st.columns(2)
+            red_flags = recon.get("red_flags", [])
+            pos_revisions = recon.get("positive_revisions", [])
+
+            with flags_col:
+                if red_flags:
+                    for rf in red_flags:
+                        sev = rf.get("severity", "minor")
+                        if sev == "critical":
+                            st.error(f"**CRITICAL:** {rf.get('flag', '')}")
+                        elif sev == "significant":
+                            st.warning(f"**{rf.get('flag', '')}**")
+                        else:
+                            st.info(rf.get("flag", ""))
+                else:
+                    st.success("No red flags identified.")
+
+            with pos_col:
+                if pos_revisions:
+                    for pr in pos_revisions:
+                        st.success(f"**{pr.get('item', '')}** — {pr.get('impact', '')}")
+                else:
+                    st.info("No positive revisions identified.")
+
+            # What would change thesis
+            change_items = thesis.get("what_would_change_thesis", [])
+            if change_items:
+                st.markdown("**What Would Change This Thesis:**")
+                for item in change_items:
+                    st.markdown(f"- ☐ {item}")
+
+            # ── Section 7: Ideal Entry ────────────────────────────
+            st.markdown("---")
+            st.subheader("Entry & Position Sizing")
+
+            entry_price = thesis.get("ideal_entry_price")
+            sizing = thesis.get("position_sizing_suggestion", "N/A")
+            timeline = thesis.get("time_to_thesis_realization", "N/A")
+
+            en1, en2, en3 = st.columns(3)
+            with en1:
+                if entry_price and price:
+                    pct_diff = ((price - entry_price) / entry_price) * 100
+                    st.metric("Ideal Entry Price", f"${entry_price:.2f}",
+                              delta=f"{pct_diff:+.1f}% vs current",
+                              delta_color="inverse")
+                elif entry_price:
+                    st.metric("Ideal Entry Price", f"${entry_price:.2f}")
+                else:
+                    st.metric("Ideal Entry Price", "N/A")
+            with en2:
+                st.metric("Position Sizing", sizing.replace("_", " ").title())
+            with en3:
+                st.metric("Time to Realization", timeline)
+
+            entry_reason = thesis.get("ideal_entry_reasoning", "")
+            if entry_reason:
+                st.caption(entry_reason)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
