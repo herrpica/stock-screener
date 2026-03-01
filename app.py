@@ -721,6 +721,11 @@ if st.session_state.page == "Screener":
                     msg += f" {failed} failed."
                 st.success(msg)
                 st.session_state.selected_for_deepdive = run_list
+
+                # Single stock — go straight to detail view
+                if len(run_list) == 1 and succeeded == 1:
+                    st.session_state.selected_ticker = run_list[0]
+                    st.session_state.page = "Stock Detail"
                 st.rerun()
 
             # Debug info
@@ -738,6 +743,29 @@ if st.session_state.page == "Screener":
                         & (master["composite_score"].fillna(0) >= _q75_dbg)
                     ]
                     st.text(f"Buy candidates found: {len(_bc_dbg)}")
+
+    # ── Deep Dive Results (quick access) ────────────────────────────────
+    _dd_analyzed = [t for t in df["ticker"].tolist() if t in st.session_state.deep_dive_cache]
+    if _dd_analyzed:
+        with st.expander(f"📊 Deep Dive Results ({len(_dd_analyzed)} analyzed)", expanded=True):
+            for _t in _dd_analyzed:
+                _dd = st.session_state.deep_dive_cache[_t]
+                _thesis = _dd.get("investment_thesis", {})
+                _rec = _thesis.get("recommendation", "N/A")
+                _one_liner = _thesis.get("one_line_thesis", "")
+                _comp = st.session_state.all_data.get(_t, {}).get("company", _t)
+                rc1, rc2 = st.columns([4, 1])
+                with rc1:
+                    st.markdown(
+                        f"{_rec_badge(_rec)} **{_t}** — {_comp}  \n"
+                        f"*{_one_liner}*",
+                        unsafe_allow_html=True,
+                    )
+                with rc2:
+                    if st.button("View Detail →", key=f"dd_view_{_t}"):
+                        st.session_state.selected_ticker = _t
+                        st.session_state.page = "Stock Detail"
+                        st.rerun()
 
     # Ticker selection for detail view
     sel = st.selectbox(
