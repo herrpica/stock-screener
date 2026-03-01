@@ -62,6 +62,10 @@ def _cache_path(ticker: str) -> Path:
     return CACHE_DIR / f"{ticker.upper()}_deep_dive.json"
 
 
+def _history_dir(ticker: str) -> Path:
+    return CACHE_DIR / "history" / ticker.upper()
+
+
 def load_cached_deep_dive(ticker: str) -> dict | None:
     """Load cached deep dive result if it exists and is less than 7 days old."""
     path = _cache_path(ticker)
@@ -79,11 +83,69 @@ def load_cached_deep_dive(ticker: str) -> dict | None:
 
 
 def save_deep_dive_cache(ticker: str, result: dict):
-    """Save deep dive result to JSON cache."""
+    """Save deep dive result to JSON cache (latest + history)."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    # Save as latest
     path = _cache_path(ticker)
     with open(path, "w") as f:
         json.dump(result, f, indent=2, default=str)
+    # Append to history
+    hist_dir = _history_dir(ticker)
+    hist_dir.mkdir(parents=True, exist_ok=True)
+    ts = result.get("analysis_timestamp", datetime.now().isoformat())
+    ts_safe = ts.replace(":", "-").replace(" ", "_")[:19]
+    hist_path = hist_dir / f"{ts_safe}.json"
+    with open(hist_path, "w") as f:
+        json.dump(result, f, indent=2, default=str)
+
+
+def load_deep_dive_history(ticker: str) -> list[dict]:
+    """Load all historical deep dive results for a ticker.
+
+    Returns list of dicts sorted newest first, each with keys:
+    'timestamp', 'recommendation', 'one_line_thesis', 'file_path'.
+    """
+    hist_dir = _history_dir(ticker)
+    if not hist_dir.exists():
+        # Check if there's a single legacy cache file to include
+        legacy = _cache_path(ticker)
+        if legacy.exists():
+            try:
+                with open(legacy, "r") as f:
+                    data = json.load(f)
+                return [{
+                    "timestamp": data.get("analysis_timestamp", "Unknown"),
+                    "recommendation": data.get("investment_thesis", {}).get("recommendation", "N/A"),
+                    "one_line_thesis": data.get("investment_thesis", {}).get("one_line_thesis", ""),
+                    "file_path": str(legacy),
+                }]
+            except Exception:
+                pass
+        return []
+
+    entries = []
+    for p in sorted(hist_dir.glob("*.json"), reverse=True):
+        try:
+            with open(p, "r") as f:
+                data = json.load(f)
+            entries.append({
+                "timestamp": data.get("analysis_timestamp", "Unknown"),
+                "recommendation": data.get("investment_thesis", {}).get("recommendation", "N/A"),
+                "one_line_thesis": data.get("investment_thesis", {}).get("one_line_thesis", ""),
+                "file_path": str(p),
+            })
+        except Exception:
+            continue
+    return entries
+
+
+def load_deep_dive_by_path(file_path: str) -> dict | None:
+    """Load a specific deep dive result from its file path."""
+    try:
+        with open(file_path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 def estimate_deep_dive_cost() -> str:

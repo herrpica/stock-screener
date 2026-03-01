@@ -29,7 +29,8 @@ from scenario_engine import (
 from sec_fetcher import get_full_sec_analysis, get_recent_filings
 from deep_dive_engine import (
     run_deep_dive, fetch_all_documents, estimate_deep_dive_cost,
-    load_cached_deep_dive, STEPS as DD_STEPS,
+    load_cached_deep_dive, load_deep_dive_history, load_deep_dive_by_path,
+    STEPS as DD_STEPS,
 )
 
 # ── App config ──────────────────────────────────────────────────────────────
@@ -72,6 +73,7 @@ def _init_state():
         "session_api_cost": 0.0,
         "screener_search": "",
         "selected_for_deepdive": [],
+        "dd_show_inline": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -79,6 +81,20 @@ def _init_state():
 
 
 _init_state()
+
+# Load any existing deep dive cache files from disk on first run
+if not st.session_state.deep_dive_cache:
+    from pathlib import Path as _Path
+    _dd_dir = _Path(__file__).parent / ".cache" / "deep_dive"
+    if _dd_dir.exists():
+        import json as _json
+        for _f in _dd_dir.glob("*_deep_dive.json"):
+            _tk = _f.stem.replace("_deep_dive", "").upper()
+            try:
+                with open(_f) as _fp:
+                    st.session_state.deep_dive_cache[_tk] = _json.load(_fp)
+            except Exception:
+                pass
 
 
 # ── Data loading & computation ──────────────────────────────────────────────
@@ -273,6 +289,144 @@ _API_COSTS = {
 def _track_cost(call_type: str, count: int = 1):
     """Add estimated API cost to the session total."""
     st.session_state.session_api_cost += _API_COSTS[call_type] * count
+
+
+def _render_dd_inline(dd_result, ticker, val=None):
+    """Render deep dive results inline — no tab navigation required."""
+    thesis = dd_result.get("investment_thesis", {})
+    biz = dd_result.get("business_assessment", {})
+    recon = dd_result.get("metric_reconciliation", {})
+    fwd = dd_result.get("forward_analysis", {})
+    adj_scores = dd_result.get("adjusted_scores", {})
+    adj_val = dd_result.get("adjusted_valuation", {})
+
+    rec = thesis.get("recommendation", "N/A")
+    conviction = thesis.get("conviction_level", "N/A")
+    one_liner = thesis.get("one_line_thesis", "")
+
+    _REC_COLORS = {
+        "Strong Buy": "#1a7a3a", "Buy": "#27ae60",
+        "Hold": "#f39c12", "Avoid": "#e67e22", "Strong Avoid": "#c0392b",
+    }
+    rec_color = _REC_COLORS.get(rec, "gray")
+
+    # ── Recommendation ──
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:12px;margin:12px 0">'
+        f'<span style="background:{rec_color};color:white;padding:10px 22px;'
+        f'border-radius:8px;font-size:1.4em;font-weight:bold">{rec}</span>'
+        f'<span style="background:#eee;padding:8px 16px;border-radius:6px">'
+        f'Conviction: {conviction.upper()}</span></div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(f'*{one_liner}*')
+    memo = thesis.get("memo_summary", "")
+    if memo:
+        st.info(memo)
+
+    # ── Score Adjustments ──
+    st.subheader("Score Adjustments")
+    orig_scores = dd_result.get("original_scores", {})
+    change_rows = []
+    for key, name in [("quality_score", "Quality"), ("growth_score", "Growth"),
+                      ("value_score", "Value"), ("sentiment_score", "Sentiment"),
+                      ("composite_score", "Composite")]:
+        orig = orig_scores.get(key, "—")
+        adj = adj_scores.get(key, orig)
+        delta = adj_scores.get(f"{key}_delta", 0)
+        change_rows.append({"Metric": name, "Original": orig, "Adjusted": adj,
+                            "Change": f"{delta:+.1f}" if isinstance(delta, (int, float)) and delta else "—"})
+    if val:
+        orig_iv = val.get("intrinsic_value")
+        adj_iv = adj_val.get("intrinsic_value", 0)
+        iv_d = adj_val.get("intrinsic_value_delta", 0)
+        change_rows.append({"Metric": "Intrinsic Value",
+                            "Original": f"${orig_iv:.2f}" if orig_iv else "N/A",
+                            "Adjusted": f"${adj_iv:.2f}",
+                            "Change": f"${iv_d:+.2f}" if iv_d else "—"})
+    st.dataframe(pd.DataFrame(change_rows), hide_index=True, use_container_width=True)
+
+    # ── Bull / Base / Bear ──
+    st.subheader("Scenario Analysis")
+    bull = thesis.get("bull_case", {})
+    base_case = thesis.get("base_case", {})
+    bear = thesis.get("bear_case", {})
+    bc1, bc2, bc3 = st.columns(3)
+    with bc1:
+        st.markdown("#### 🟢 Bull Case")
+        up = bull.get("upside_to_intrinsic_value_pct")
+        if up is not None:
+            st.markdown(f'<span style="font-size:1.5em;font-weight:bold;color:#27ae60">+{up:.0f}%</span>',
+                        unsafe_allow_html=True)
+        st.markdown(bull.get("narrative", ""))
+        for a in bull.get("key_assumptions", []):
+            st.markdown(f"- {a}")
+    with bc2:
+        st.markdown("#### 🟡 Base Case")
+        ret = base_case.get("expected_return_12_month_pct")
+        if ret is not None:
+            c = "#27ae60" if ret > 0 else "#e74c3c"
+            st.markdown(f'<span style="font-size:1.5em;font-weight:bold;color:{c}">{ret:+.0f}%</span>',
+                        unsafe_allow_html=True)
+        st.markdown(base_case.get("narrative", ""))
+        for a in base_case.get("key_assumptions", []):
+            st.markdown(f"- {a}")
+    with bc3:
+        st.markdown("#### 🔴 Bear Case")
+        dn = bear.get("downside_pct")
+        if dn is not None:
+            st.markdown(f'<span style="font-size:1.5em;font-weight:bold;color:#e74c3c">-{abs(dn):.0f}%</span>',
+                        unsafe_allow_html=True)
+        st.markdown(bear.get("narrative", ""))
+        for r in bear.get("key_risks", []):
+            st.markdown(f"- {r}")
+
+    # ── Red Flags ──
+    red_flags = recon.get("red_flags", [])
+    if red_flags:
+        st.subheader("Red Flags")
+        for rf in red_flags:
+            sev = rf.get("severity", "minor")
+            if sev == "critical":
+                st.error(f"**CRITICAL:** {rf.get('flag', '')}")
+            elif sev == "significant":
+                st.warning(f"**{rf.get('flag', '')}**")
+            else:
+                st.info(rf.get("flag", ""))
+
+    # ── Forward Outlook ──
+    st.subheader("Forward Outlook")
+    fo1, fo2, fo3 = st.columns(3)
+    with fo1:
+        mt = fwd.get("margin_trajectory", {})
+        st.metric("Margin Trajectory", mt.get("direction", "N/A"))
+    with fo2:
+        rt = fwd.get("revenue_trajectory", {})
+        st.metric("Revenue Trajectory", rt.get("direction", "N/A"))
+    with fo3:
+        st.metric("Competitive Position", fwd.get("competitive_position_trend", "N/A"))
+
+    catalysts = fwd.get("growth_catalysts", [])
+    if catalysts:
+        cat_rows = [{"Catalyst": c.get("catalyst", ""), "Timeline": c.get("timeline", ""),
+                     "Magnitude": c.get("magnitude", "")} for c in catalysts]
+        st.dataframe(pd.DataFrame(cat_rows), hide_index=True, use_container_width=True)
+
+    # ── Entry Analysis ──
+    st.subheader("Entry Analysis")
+    entry_price = thesis.get("ideal_entry_price")
+    sizing = thesis.get("position_sizing_suggestion", "N/A")
+    timeline = thesis.get("time_to_thesis_realization", "N/A")
+    e1, e2, e3 = st.columns(3)
+    with e1:
+        if entry_price:
+            st.metric("Ideal Entry Price", f"${entry_price:.2f}")
+        else:
+            st.metric("Ideal Entry Price", "N/A")
+    with e2:
+        st.metric("Position Sizing", sizing.replace("_", " ").title() if isinstance(sizing, str) else "N/A")
+    with e3:
+        st.metric("Time to Realization", timeline)
 
 
 def _run_dd_for_ticker(ticker, api_key, force_refresh=False):
@@ -721,11 +875,7 @@ if st.session_state.page == "Screener":
                     msg += f" {failed} failed."
                 st.success(msg)
                 st.session_state.selected_for_deepdive = run_list
-
-                # Single stock — go straight to detail view
-                if len(run_list) == 1 and succeeded == 1:
-                    st.session_state.selected_ticker = run_list[0]
-                    st.session_state.page = "Stock Detail"
+                st.session_state.dd_show_inline = run_list[0] if len(run_list) == 1 else None
                 st.rerun()
 
             # Debug info
@@ -743,6 +893,27 @@ if st.session_state.page == "Screener":
                         & (master["composite_score"].fillna(0) >= _q75_dbg)
                     ]
                     st.text(f"Buy candidates found: {len(_bc_dbg)}")
+
+    # ── Inline Deep Dive Result (single stock) ──────────────────────────
+    _dd_inline_ticker = st.session_state.get("dd_show_inline")
+    if _dd_inline_ticker and _dd_inline_ticker in st.session_state.deep_dive_cache:
+        _dd_inline = st.session_state.deep_dive_cache[_dd_inline_ticker]
+        _comp_name = st.session_state.all_data.get(_dd_inline_ticker, {}).get("company", _dd_inline_ticker)
+        _t_val = st.session_state.valuations.get(_dd_inline_ticker)
+        st.success(f"Deep Dive Complete — {_dd_inline_ticker} ({_comp_name})")
+        _render_dd_inline(_dd_inline, _dd_inline_ticker, val=_t_val)
+        vc1, vc2 = st.columns(2)
+        with vc1:
+            if st.button("View Full Detail →", key="dd_inline_go_detail", type="primary"):
+                st.session_state.selected_ticker = _dd_inline_ticker
+                st.session_state.page = "Stock Detail"
+                st.session_state.dd_show_inline = None
+                st.rerun()
+        with vc2:
+            if st.button("Dismiss", key="dd_inline_dismiss"):
+                st.session_state.dd_show_inline = None
+                st.rerun()
+        st.divider()
 
     # ── Deep Dive Results (quick access) ────────────────────────────────
     _dd_analyzed = [t for t in df["ticker"].tolist() if t in st.session_state.deep_dive_cache]
@@ -922,6 +1093,27 @@ elif st.session_state.page == "Stock Detail":
             _track_cost("deep_dive")
             st.session_state.deep_dive_cache[ticker] = dd_result
             st.rerun()
+
+    # ── Deep Dive History Log ─────────────────────────────────────
+    dd_history = load_deep_dive_history(ticker)
+    if dd_history:
+        with st.expander(f"📋 Deep Dive History ({len(dd_history)} analyses)", expanded=False):
+            for i, entry in enumerate(dd_history):
+                ts = entry["timestamp"][:16].replace("T", " ")
+                rec = entry["recommendation"]
+                thesis = entry["one_line_thesis"]
+                hc1, hc2 = st.columns([5, 1])
+                with hc1:
+                    st.markdown(
+                        f"{_rec_badge(rec)} **{ts}** — *{thesis}*",
+                        unsafe_allow_html=True,
+                    )
+                with hc2:
+                    if st.button("View", key=f"dd_hist_{i}"):
+                        hist_data = load_deep_dive_by_path(entry["file_path"])
+                        if hist_data:
+                            st.session_state.deep_dive_cache[ticker] = hist_data
+                            st.rerun()
 
     # ── Tabbed Detail View ──────────────────────────────────────────
     tab_names = ["Valuation", "Scores", "Quality Rating", "SEC Intelligence", "Raw Data"]
