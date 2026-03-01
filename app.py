@@ -375,7 +375,7 @@ if st.session_state.page == "Screener":
                             help="Tech + AI-exposed stocks with strong scores")
     with qf_cols[5]:
         show_dd_buy = st.button("DD Buy/Strong Buy", use_container_width=True,
-                                help="Deep Dive recommendation: Buy or Strong Buy")
+                                help="Filter to Deep Dive Buy or Strong Buy only")
 
     # Determine active filter
     if "quick_filter" not in st.session_state:
@@ -530,6 +530,121 @@ if st.session_state.page == "Screener":
         hide_index=True,
     )
     st.caption(f"Showing {len(table_df)} of {len(master)} stocks")
+
+    # ── Deep Dive Runner ─────────────────────────────────────────────────
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+
+    with st.expander("🔬 Run Deep Dive Analysis", expanded=False):
+        dd_mode = st.radio(
+            "Analyze:",
+            ["Individual stock", "Select stocks", "All Buy/Strong Buy candidates"],
+            horizontal=True,
+            key="dd_batch_mode",
+        )
+
+        dd_targets = []
+        if dd_mode == "Individual stock":
+            dd_pick = st.selectbox(
+                "Select stock",
+                options=df["ticker"].tolist(),
+                index=None,
+                key="dd_individual_pick",
+                placeholder="Type or select a ticker...",
+            )
+            if dd_pick:
+                dd_targets = [dd_pick]
+        elif dd_mode == "Select stocks":
+            dd_picks = st.multiselect(
+                "Select stocks",
+                options=sorted(df["ticker"].tolist()),
+                max_selections=10,
+                key="dd_multi_picks",
+            )
+            dd_targets = dd_picks
+        else:  # All Buy/Strong Buy
+            buy_df = df[(df["quality_rating"] == "Above Bar") & (df[mos_col].fillna(-999) > 20)]
+            dd_targets = buy_df["ticker"].tolist()
+            st.caption(f"{len(dd_targets)} Buy candidates found")
+
+        # Show which already have deep dives cached
+        dd_cache = st.session_state.deep_dive_cache
+        already_done = [t for t in dd_targets if t in dd_cache]
+        need_run = [t for t in dd_targets if t not in dd_cache]
+
+        if dd_targets:
+            info_parts = []
+            if need_run:
+                est_cost = len(need_run) * _API_COSTS["deep_dive"]
+                est_time = len(need_run) * 75  # ~75 sec each
+                info_parts.append(
+                    f"**{len(need_run)}** to analyze (~${est_cost:.2f}, ~{est_time // 60}m {est_time % 60}s)"
+                )
+            if already_done:
+                info_parts.append(f"**{len(already_done)}** already cached")
+            st.info(" | ".join(info_parts))
+
+        bc1, bc2 = st.columns(2)
+        with bc1:
+            dd_run_batch = st.button(
+                f"Run Deep Dive ({len(need_run)} stock{'s' if len(need_run) != 1 else ''})",
+                type="primary",
+                disabled=not need_run or not api_key,
+                key="dd_batch_run",
+            )
+        with bc2:
+            dd_force_all = st.button(
+                f"Re-run All ({len(dd_targets)} stock{'s' if len(dd_targets) != 1 else ''})",
+                disabled=not dd_targets or not api_key,
+                key="dd_batch_rerun",
+            )
+
+        if dd_run_batch or dd_force_all:
+            run_list = dd_targets if dd_force_all else need_run
+            progress = st.progress(0, text="Starting deep dive batch...")
+            for i, t in enumerate(run_list):
+                progress.progress(
+                    (i + 1) / len(run_list),
+                    text=f"Analyzing {t} ({i + 1}/{len(run_list)})...",
+                )
+                t_data = st.session_state.all_data.get(t, {})
+                t_info = t_data.get("info", {})
+                t_val = st.session_state.valuations.get(t, {})
+                t_row = master[master["ticker"] == t].iloc[0] if t in master["ticker"].values else None
+                t_scores = {}
+                if t_row is not None:
+                    t_scores = {
+                        "quality_score": t_row.get("quality_score", 50),
+                        "growth_score": t_row.get("growth_score", 50),
+                        "value_score": t_row.get("value_score", 50),
+                        "sentiment_score": t_row.get("sentiment_score", 50),
+                        "composite_score": t_row.get("composite_score", 50),
+                    }
+                t_qr = {}
+                if st.session_state.ratings_df is not None:
+                    rr = st.session_state.ratings_df
+                    rr_rows = rr[rr["ticker"] == t]
+                    if not rr_rows.empty:
+                        t_qr = rr_rows.iloc[0].to_dict()
+
+                result = run_deep_dive(
+                    ticker=t,
+                    company_name=t_data.get("company", t_info.get("shortName", t)),
+                    current_scores=t_scores,
+                    current_valuation=t_val,
+                    current_quality_rating=t_qr,
+                    sector=t_data.get("sector", t_info.get("sector", "")),
+                    sector_medians={},
+                    api_key=api_key,
+                    discount_rate=st.session_state.discount_rate / 100,
+                    force_refresh=dd_force_all,
+                )
+                if "error" not in result:
+                    _track_cost("deep_dive")
+                    st.session_state.deep_dive_cache[t] = result
+
+            progress.empty()
+            st.success(f"Completed deep dive for {len(run_list)} stock{'s' if len(run_list) != 1 else ''}.")
+            st.rerun()
 
     # Ticker selection for detail view
     sel = st.selectbox(
