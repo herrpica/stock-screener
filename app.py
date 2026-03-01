@@ -70,6 +70,8 @@ def _init_state():
         "dd_running": False,
         "dd_progress_step": 0,
         "session_api_cost": 0.0,
+        "screener_search": "",
+        "selected_for_deepdive": [],
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -273,6 +275,50 @@ def _track_cost(call_type: str, count: int = 1):
     st.session_state.session_api_cost += _API_COSTS[call_type] * count
 
 
+def _run_dd_for_ticker(ticker, api_key, force_refresh=False):
+    """Run deep dive for a single ticker. Returns result dict or None on error."""
+    t_data = st.session_state.all_data.get(ticker, {})
+    t_info = t_data.get("info", {})
+    t_val = st.session_state.valuations.get(ticker, {})
+    m = st.session_state.master_df
+    t_row = m[m["ticker"] == ticker].iloc[0] if ticker in m["ticker"].values else None
+    t_scores = {}
+    if t_row is not None:
+        t_scores = {
+            "quality_score": t_row.get("quality_score", 50),
+            "growth_score": t_row.get("growth_score", 50),
+            "value_score": t_row.get("value_score", 50),
+            "sentiment_score": t_row.get("sentiment_score", 50),
+            "composite_score": t_row.get("composite_score", 50),
+        }
+    t_qr = {}
+    if st.session_state.ratings_df is not None:
+        rr = st.session_state.ratings_df
+        rr_rows = rr[rr["ticker"] == ticker]
+        if not rr_rows.empty:
+            t_qr = rr_rows.iloc[0].to_dict()
+    try:
+        result = run_deep_dive(
+            ticker=ticker,
+            company_name=t_data.get("company", t_info.get("shortName", ticker)),
+            current_scores=t_scores,
+            current_valuation=t_val,
+            current_quality_rating=t_qr,
+            sector=t_data.get("sector", t_info.get("sector", "")),
+            sector_medians={},
+            api_key=api_key,
+            discount_rate=st.session_state.discount_rate / 100,
+            force_refresh=force_refresh,
+        )
+        if "error" not in result:
+            _track_cost("deep_dive")
+            st.session_state.deep_dive_cache[ticker] = result
+            return result
+        return None
+    except Exception:
+        return None
+
+
 # ── Load data on first run ──────────────────────────────────────────────────
 
 if not st.session_state.data_loaded:
@@ -357,6 +403,15 @@ if st.session_state.page == "Screener":
                 st.rerun()
 
     st.header("S&P 500 Stock Screener")
+
+    # ── Search bar ───────────────────────────────────────────────────
+    search_term = st.text_input(
+        "Search by ticker or company name",
+        value=st.session_state.get("screener_search_term", ""),
+        key="screener_search_input",
+        placeholder="e.g. AMZN or Amazon...",
+    )
+    st.session_state.screener_search_term = search_term
 
     # Quick filter buttons
     qf_cols = st.columns(6)
@@ -450,6 +505,14 @@ if st.session_state.page == "Screener":
     if dd_only:
         df = df[df["has_dd"]]
 
+    # Apply search filter
+    if search_term.strip():
+        s = search_term.strip().upper()
+        df = df[
+            df["ticker"].str.upper().str.contains(s, na=False)
+            | df["company"].str.upper().str.contains(s, na=False)
+        ]
+
     # Quick filter overrides
     qf = st.session_state.quick_filter
     if qf == "above":
@@ -531,13 +594,21 @@ if st.session_state.page == "Screener":
     )
     st.caption(f"Showing {len(table_df)} of {len(master)} stocks")
 
+    # Single match — quick navigate
+    if len(df) == 1:
+        only_ticker = df["ticker"].iloc[0]
+        if st.button(f"View Detail → {only_ticker}", type="primary", key="search_go_detail"):
+            st.session_state.selected_ticker = only_ticker
+            st.session_state.page = "Stock Detail"
+            st.rerun()
+
     # ── Deep Dive Runner ─────────────────────────────────────────────────
     api_key = os.environ.get("ANTHROPIC_API_KEY")
 
     with st.expander("🔬 Run Deep Dive Analysis", expanded=False):
         dd_mode = st.radio(
             "Analyze:",
-            ["Individual stock", "Select stocks", "All Buy/Strong Buy candidates"],
+            ["Individual stock", "Select stocks", "Buy candidates"],
             horizontal=True,
             key="dd_batch_mode",
         )
@@ -555,13 +626,13 @@ if st.session_state.page == "Screener":
                 dd_targets = [dd_pick]
         elif dd_mode == "Select stocks":
             dd_picks = st.multiselect(
-                "Select stocks",
+                "Select stocks (up to 20)",
                 options=sorted(df["ticker"].tolist()),
-                max_selections=10,
+                max_selections=20,
                 key="dd_multi_picks",
             )
             dd_targets = dd_picks
-        else:  # All Buy/Strong Buy
+        else:  # Buy candidates
             buy_df = df[(df["quality_rating"] == "Above Bar") & (df[mos_col].fillna(-999) > 20)]
             dd_targets = buy_df["ticker"].tolist()
             st.caption(f"{len(dd_targets)} Buy candidates found")
@@ -575,13 +646,21 @@ if st.session_state.page == "Screener":
             info_parts = []
             if need_run:
                 est_cost = len(need_run) * _API_COSTS["deep_dive"]
-                est_time = len(need_run) * 75  # ~75 sec each
+                est_time = len(need_run) * 75
                 info_parts.append(
                     f"**{len(need_run)}** to analyze (~${est_cost:.2f}, ~{est_time // 60}m {est_time % 60}s)"
                 )
             if already_done:
                 info_parts.append(f"**{len(already_done)}** already cached")
             st.info(" | ".join(info_parts))
+
+        # Warning for large batches
+        if len(need_run) > 20:
+            est_cost = len(need_run) * _API_COSTS["deep_dive"]
+            st.warning(
+                f"This will analyze {len(need_run)} stocks at an estimated cost "
+                f"of ${est_cost:.2f}. Use the buttons below to confirm."
+            )
 
         bc1, bc2 = st.columns(2)
         with bc1:
@@ -601,49 +680,25 @@ if st.session_state.page == "Screener":
         if dd_run_batch or dd_force_all:
             run_list = dd_targets if dd_force_all else need_run
             progress = st.progress(0, text="Starting deep dive batch...")
+            succeeded = 0
+            failed = 0
             for i, t in enumerate(run_list):
                 progress.progress(
                     (i + 1) / len(run_list),
                     text=f"Analyzing {t} ({i + 1}/{len(run_list)})...",
                 )
-                t_data = st.session_state.all_data.get(t, {})
-                t_info = t_data.get("info", {})
-                t_val = st.session_state.valuations.get(t, {})
-                t_row = master[master["ticker"] == t].iloc[0] if t in master["ticker"].values else None
-                t_scores = {}
-                if t_row is not None:
-                    t_scores = {
-                        "quality_score": t_row.get("quality_score", 50),
-                        "growth_score": t_row.get("growth_score", 50),
-                        "value_score": t_row.get("value_score", 50),
-                        "sentiment_score": t_row.get("sentiment_score", 50),
-                        "composite_score": t_row.get("composite_score", 50),
-                    }
-                t_qr = {}
-                if st.session_state.ratings_df is not None:
-                    rr = st.session_state.ratings_df
-                    rr_rows = rr[rr["ticker"] == t]
-                    if not rr_rows.empty:
-                        t_qr = rr_rows.iloc[0].to_dict()
-
-                result = run_deep_dive(
-                    ticker=t,
-                    company_name=t_data.get("company", t_info.get("shortName", t)),
-                    current_scores=t_scores,
-                    current_valuation=t_val,
-                    current_quality_rating=t_qr,
-                    sector=t_data.get("sector", t_info.get("sector", "")),
-                    sector_medians={},
-                    api_key=api_key,
-                    discount_rate=st.session_state.discount_rate / 100,
-                    force_refresh=dd_force_all,
-                )
-                if "error" not in result:
-                    _track_cost("deep_dive")
-                    st.session_state.deep_dive_cache[t] = result
+                result = _run_dd_for_ticker(t, api_key, force_refresh=dd_force_all)
+                if result:
+                    succeeded += 1
+                else:
+                    failed += 1
 
             progress.empty()
-            st.success(f"Completed deep dive for {len(run_list)} stock{'s' if len(run_list) != 1 else ''}.")
+            msg = f"Completed deep dive for {succeeded} stock{'s' if succeeded != 1 else ''}."
+            if failed:
+                msg += f" {failed} failed."
+            st.success(msg)
+            st.session_state.selected_for_deepdive = run_list
             st.rerun()
 
     # Ticker selection for detail view
@@ -730,27 +785,36 @@ elif st.session_state.page == "Stock Detail":
             ts = dd_result.get("analysis_timestamp", "")
             rec = dd_result.get("investment_thesis", {}).get("recommendation", "N/A")
             st.markdown(
-                f"**Deep Dive:** {_rec_badge(rec)} — analyzed {ts[:10]}",
+                f"**Deep Dive:** {_rec_badge(rec)} — Last analyzed: {ts[:10]}",
                 unsafe_allow_html=True,
             )
         else:
             st.caption(f"{estimate_deep_dive_cost()} | ~60-90 seconds")
     with dd_col2:
         if dd_result and "error" not in dd_result:
-            dd_refresh = st.button("🔄 Refresh Deep Dive", key="dd_refresh")
+            dd_refresh = st.button("🔄 Refresh", key="dd_refresh")
         else:
             dd_refresh = False
         dd_run = st.button("🔬 Run Deep Dive Analysis", type="primary",
                            disabled=not api_key, key="dd_run")
+
+    _DD_STEP_LABELS = [
+        "Fetching SEC documents...",
+        "Assessing business quality...",
+        "Reconciling metrics...",
+        "Synthesizing investment thesis...",
+    ]
 
     if dd_run or dd_refresh:
         progress_bar = st.progress(0, text="Starting deep dive analysis...")
         status_text = st.empty()
 
         def _dd_progress(step_idx, step_label):
-            frac = (step_idx + 1) / len(DD_STEPS)
-            progress_bar.progress(frac, text=f"Step {step_idx + 1}/{len(DD_STEPS)}: {step_label}...")
-            status_text.text(f"Step {step_idx + 1}/{len(DD_STEPS)}: {step_label}")
+            label = _DD_STEP_LABELS[step_idx] if step_idx < len(_DD_STEP_LABELS) else step_label
+            n = len(_DD_STEP_LABELS)
+            frac = (step_idx + 1) / n
+            progress_bar.progress(frac, text=f"Step {step_idx + 1}/{n}: {label}")
+            status_text.text(f"Step {step_idx + 1}/{n}: {label}")
 
         # Build inputs for deep dive
         scores_dict = {}
@@ -1235,9 +1299,22 @@ elif st.session_state.page == "Stock Detail":
             conviction = thesis.get("conviction_level", "N/A")
             one_liner = thesis.get("one_line_thesis", "")
 
-            st.markdown(f"### {_rec_badge(rec)}", unsafe_allow_html=True)
-            st.markdown(f"**Conviction:** {conviction.upper()}")
-            st.markdown(f"*{one_liner}*")
+            _REC_COLORS = {
+                "Strong Buy": "#1a7a3a", "Buy": "#27ae60",
+                "Hold": "#f39c12", "Avoid": "#e67e22", "Strong Avoid": "#c0392b",
+            }
+            rec_color = _REC_COLORS.get(rec, "gray")
+            st.markdown(
+                f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">'
+                f'<span style="background:{rec_color};color:white;padding:8px 18px;'
+                f'border-radius:8px;font-size:1.3em;font-weight:bold">{rec}</span>'
+                f'<span style="background:#eee;padding:6px 14px;border-radius:6px;'
+                f'font-size:0.95em">Conviction: {conviction.upper()}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(f'<p style="font-size:1.15em;font-style:italic;color:#555">{one_liner}</p>',
+                        unsafe_allow_html=True)
 
             memo = thesis.get("memo_summary", "")
             if memo:
@@ -1256,7 +1333,9 @@ elif st.session_state.page == "Stock Detail":
                 st.markdown("#### 🟢 Bull Case")
                 upside = bull.get("upside_to_intrinsic_value_pct")
                 if upside is not None:
-                    st.metric("Upside", f"+{upside:.0f}%")
+                    color = "#27ae60" if upside > 0 else "#e74c3c"
+                    st.markdown(f'<p style="font-size:1.8em;font-weight:bold;color:{color}">+{upside:.0f}%</p>',
+                                unsafe_allow_html=True)
                 st.markdown(bull.get("narrative", ""))
                 assumptions = bull.get("key_assumptions", [])
                 if assumptions:
@@ -1268,7 +1347,9 @@ elif st.session_state.page == "Stock Detail":
                 st.markdown("#### 🟡 Base Case")
                 exp_ret = base_case.get("expected_return_12_month_pct")
                 if exp_ret is not None:
-                    st.metric("12m Expected Return", f"{exp_ret:+.0f}%")
+                    color = "#27ae60" if exp_ret > 0 else "#e74c3c"
+                    st.markdown(f'<p style="font-size:1.8em;font-weight:bold;color:{color}">{exp_ret:+.0f}%</p>',
+                                unsafe_allow_html=True)
                 st.markdown(base_case.get("narrative", ""))
                 assumptions = base_case.get("key_assumptions", [])
                 if assumptions:
@@ -1280,7 +1361,8 @@ elif st.session_state.page == "Stock Detail":
                 st.markdown("#### 🔴 Bear Case")
                 downside = bear.get("downside_pct")
                 if downside is not None:
-                    st.metric("Downside", f"-{abs(downside):.0f}%")
+                    st.markdown(f'<p style="font-size:1.8em;font-weight:bold;color:#e74c3c">-{abs(downside):.0f}%</p>',
+                                unsafe_allow_html=True)
                 st.markdown(bear.get("narrative", ""))
                 risks = bear.get("key_risks", [])
                 if risks:
@@ -1288,74 +1370,98 @@ elif st.session_state.page == "Stock Detail":
                     for r in risks:
                         st.markdown(f"- {r}")
 
-            # ── Section 3: Adjusted Metrics ───────────────────────
+            # ── Section 3: What Changed ──────────────────────────
             st.markdown("---")
-            st.subheader("Adjusted Metrics")
+            st.subheader("What Changed (Score Adjustments)")
 
-            mc1, mc2, mc3, mc4 = st.columns(4)
-            with mc1:
-                q_delta = adj_scores.get("quality_score_delta", 0)
-                st.metric("Quality", f"{adj_scores.get('quality_score', 'N/A')}",
-                          delta=f"{q_delta:+.1f}" if q_delta else None)
-            with mc2:
-                g_delta = adj_scores.get("growth_score_delta", 0)
-                st.metric("Growth", f"{adj_scores.get('growth_score', 'N/A')}",
-                          delta=f"{g_delta:+.1f}" if g_delta else None)
-            with mc3:
-                v_delta = adj_scores.get("value_score_delta", 0)
-                st.metric("Value", f"{adj_scores.get('value_score', 'N/A')}",
-                          delta=f"{v_delta:+.1f}" if v_delta else None)
-            with mc4:
-                s_delta = adj_scores.get("sentiment_score_delta", 0)
-                st.metric("Sentiment", f"{adj_scores.get('sentiment_score', 'N/A')}",
-                          delta=f"{s_delta:+.1f}" if s_delta else None)
+            # Full comparison table
+            orig_scores = dd_result.get("original_scores", {})
+            orig_rating = dd_result.get("original_quality_rating", "N/A")
+            adj_rating = dd_result.get("adjusted_quality_rating", orig_rating)
+            adj_detail = recon.get("score_adjustments", {})
+            iv_detail = recon.get("intrinsic_value_adjustments", {})
 
-            vc1, vc2, vc3 = st.columns(3)
-            with vc1:
-                iv_delta = adj_val.get("intrinsic_value_delta", 0)
-                st.metric("Adj. Intrinsic Value",
-                          f"${adj_val.get('intrinsic_value', 0):.2f}",
-                          delta=f"${iv_delta:+.2f}" if iv_delta else None)
-            with vc2:
-                mos_delta = adj_val.get("margin_of_safety_delta", 0)
-                st.metric("Adj. Margin of Safety",
-                          f"{adj_val.get('margin_of_safety', 0):.1f}%",
-                          delta=f"{mos_delta:+.1f}%" if mos_delta else None)
-            with vc3:
-                orig_rating = dd_result.get("original_quality_rating", "N/A")
-                adj_rating = dd_result.get("adjusted_quality_rating", orig_rating)
-                changed = adj_rating != orig_rating
-                st.metric("Quality Rating", adj_rating,
-                          delta=f"was {orig_rating}" if changed else None)
+            def _delta_cell(delta_val, fmt=".1f"):
+                """Return colored delta string."""
+                if isinstance(delta_val, str):
+                    return delta_val
+                if delta_val > 0:
+                    return f"+{delta_val:{fmt}}"
+                if delta_val < 0:
+                    return f"{delta_val:{fmt}}"
+                return "0"
 
-            # What changed and why
-            with st.expander("What changed and why"):
-                adj_detail = recon.get("score_adjustments", {})
-                adj_rows = []
-                for pillar in ["quality_score", "growth_score", "value_score", "sentiment_score"]:
-                    pa = adj_detail.get(pillar, {})
-                    adj_rows.append({
-                        "Pillar": pillar.replace("_score", "").title(),
-                        "Adjustment": pa.get("adjustment", 0),
-                        "Reasoning": pa.get("reasoning", "N/A"),
-                    })
-                iv_detail = recon.get("intrinsic_value_adjustments", {})
-                adj_rows.append({
-                    "Pillar": "Growth Rate",
-                    "Adjustment": f"{iv_detail.get('growth_rate_adjustment', 0):+.2%}",
-                    "Reasoning": iv_detail.get("reasoning", "N/A"),
+            change_rows = []
+            for pillar_key, pillar_name in [
+                ("quality_score", "Quality Score"),
+                ("growth_score", "Growth Score"),
+                ("value_score", "Value Score"),
+                ("sentiment_score", "Sentiment Score"),
+                ("composite_score", "Composite Score"),
+            ]:
+                orig = orig_scores.get(pillar_key, "—")
+                adj = adj_scores.get(pillar_key, orig)
+                delta = adj_scores.get(f"{pillar_key}_delta", 0)
+                reason = adj_detail.get(pillar_key, {}).get("reasoning", "—")
+                change_rows.append({
+                    "Metric": pillar_name,
+                    "Original": f"{orig}" if isinstance(orig, (int, float)) else orig,
+                    "Adjusted": f"{adj}" if isinstance(adj, (int, float)) else adj,
+                    "Delta": _delta_cell(delta),
+                    "Reason": reason,
                 })
-                adj_rows.append({
-                    "Pillar": "EPS Base",
-                    "Adjustment": f"{iv_detail.get('earnings_base_adjustment_pct', 0):+.0%}",
-                    "Reasoning": iv_detail.get("earnings_base_reasoning", "N/A"),
-                })
-                adj_rows.append({
-                    "Pillar": "Discount Rate",
-                    "Adjustment": f"{iv_detail.get('discount_rate_adjustment', 0):+.2%}",
-                    "Reasoning": iv_detail.get("discount_rate_reasoning", "N/A"),
-                })
-                st.dataframe(pd.DataFrame(adj_rows), hide_index=True, use_container_width=True)
+
+            # Intrinsic Value
+            orig_iv = val.get("intrinsic_value")
+            adj_iv_val = adj_val.get("intrinsic_value", 0)
+            iv_delta = adj_val.get("intrinsic_value_delta", 0)
+            change_rows.append({
+                "Metric": "Intrinsic Value",
+                "Original": f"${orig_iv:.2f}" if orig_iv else "N/A",
+                "Adjusted": f"${adj_iv_val:.2f}",
+                "Delta": f"${iv_delta:+.2f}" if iv_delta else "0",
+                "Reason": iv_detail.get("reasoning", "—"),
+            })
+
+            # Margin of Safety
+            orig_mos = val.get("margin_of_safety")
+            adj_mos_val = adj_val.get("margin_of_safety", 0)
+            mos_delta = adj_val.get("margin_of_safety_delta", 0)
+            change_rows.append({
+                "Metric": "Margin of Safety",
+                "Original": f"{orig_mos:.1f}%" if orig_mos is not None else "N/A",
+                "Adjusted": f"{adj_mos_val:.1f}%",
+                "Delta": f"{mos_delta:+.1f}%" if mos_delta else "0",
+                "Reason": "",
+            })
+
+            # Quality Rating
+            rating_changed = adj_rating != orig_rating
+            change_rows.append({
+                "Metric": "Quality Rating",
+                "Original": orig_rating,
+                "Adjusted": adj_rating,
+                "Delta": "Changed" if rating_changed else "—",
+                "Reason": "",
+            })
+
+            change_df = pd.DataFrame(change_rows)
+
+            def _color_delta(v):
+                if not isinstance(v, str):
+                    return ""
+                v_stripped = v.replace("$", "").replace("%", "").strip()
+                if v_stripped.startswith("+"):
+                    return "color: #27ae60; font-weight: bold"
+                if v_stripped.startswith("-"):
+                    return "color: #e74c3c; font-weight: bold"
+                return "color: gray"
+
+            st.dataframe(
+                change_df.style.map(_color_delta, subset=["Delta"]),
+                hide_index=True,
+                use_container_width=True,
+            )
 
             # ── Section 4: Business Quality ───────────────────────
             st.markdown("---")
@@ -2100,6 +2206,101 @@ elif st.session_state.page == "SEC Intelligence":
         progress.empty()
         st.success(f"Completed batch analysis for {len(batch_options)} stocks.")
         st.rerun()
+
+    # ── Deep Dive: Top Buy Candidates ─────────────────────────────────
+    st.divider()
+    st.subheader("🔬 Deep Dive — Top Buy Candidates")
+    st.markdown(
+        "Run comprehensive AI deep dive analysis on top-ranked stocks. "
+        "Buy candidates: Above Bar quality + positive margin of safety + top quartile score."
+    )
+
+    dd_top_n = st.selectbox(
+        "Analyze top:",
+        ["Top 10", "Top 25", "Top 50"],
+        index=1,
+        key="dd_top_n_select",
+    )
+    n_limit = int(dd_top_n.split()[1])
+
+    # Build buy candidates list
+    _buy_cands = master[
+        (master["quality_rating"] == "Above Bar")
+        & (master["margin_of_safety"].fillna(-999) > 0)
+        & (master["composite_score"].fillna(0) >= master["composite_score"].quantile(0.75))
+    ].nlargest(n_limit, "composite_score")
+    _buy_tickers = _buy_cands["ticker"].tolist()
+
+    _dd_cache = st.session_state.deep_dive_cache
+    _dd_need = [t for t in _buy_tickers if t not in _dd_cache]
+    _dd_have = [t for t in _buy_tickers if t in _dd_cache]
+
+    with st.expander(f"Preview: {len(_buy_tickers)} candidates", expanded=False):
+        if not _buy_tickers:
+            st.info("No stocks match buy candidate criteria with current settings.")
+        else:
+            preview_df = _buy_cands[["ticker", "company", "composite_score",
+                                     "margin_of_safety", "quality_rating"]].copy()
+            preview_df.columns = ["Ticker", "Company", "Score", "MoS %", "Rating"]
+            st.dataframe(preview_df, hide_index=True, use_container_width=True)
+
+    if _buy_tickers:
+        est_cost = len(_dd_need) * _API_COSTS["deep_dive"]
+        est_time = len(_dd_need) * 75
+        info_parts = []
+        if _dd_need:
+            info_parts.append(f"**{len(_dd_need)}** to analyze (~${est_cost:.2f}, ~{est_time // 60}m {est_time % 60}s)")
+        if _dd_have:
+            info_parts.append(f"**{len(_dd_have)}** already cached")
+        st.info(" | ".join(info_parts))
+
+        dd_confirm = st.button(
+            f"Confirm — Analyze {len(_dd_need)} stocks (~${est_cost:.2f})",
+            type="primary",
+            disabled=not _dd_need or not api_key,
+            key="dd_buy_confirm",
+        )
+
+        if dd_confirm:
+            progress = st.progress(0, text="Starting deep dive batch...")
+            succeeded = 0
+            failed = 0
+            for i, t in enumerate(_dd_need):
+                progress.progress(
+                    (i + 1) / len(_dd_need),
+                    text=f"Analyzing {t} ({i + 1}/{len(_dd_need)})...",
+                )
+                result = _run_dd_for_ticker(t, api_key)
+                if result:
+                    succeeded += 1
+                else:
+                    failed += 1
+            progress.empty()
+            msg = f"Completed deep dive for {succeeded} stock{'s' if succeeded != 1 else ''}."
+            if failed:
+                msg += f" {failed} failed."
+            st.success(msg)
+            st.rerun()
+
+    # Deep dive results summary (on SEC Intelligence page)
+    if st.session_state.deep_dive_cache:
+        st.divider()
+        st.subheader("Deep Dive Results")
+        _dd_rows = []
+        # Sort by recommendation strength
+        _rec_order = {"Strong Buy": 0, "Buy": 1, "Hold": 2, "Avoid": 3, "Strong Avoid": 4}
+        for t, dd in st.session_state.deep_dive_cache.items():
+            thesis = dd.get("investment_thesis", {})
+            rec = thesis.get("recommendation", "N/A")
+            _dd_rows.append({
+                "Ticker": t,
+                "Recommendation": rec,
+                "Conviction": thesis.get("conviction_level", "N/A"),
+                "Thesis": thesis.get("one_line_thesis", ""),
+                "_sort": _rec_order.get(rec, 5),
+            })
+        _dd_summary = pd.DataFrame(_dd_rows).sort_values("_sort").drop(columns=["_sort"])
+        st.dataframe(_dd_summary, hide_index=True, use_container_width=True)
 
     # Show summary of all cached SEC analyses
     if st.session_state.sec_cache:
