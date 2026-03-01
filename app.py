@@ -605,101 +605,139 @@ if st.session_state.page == "Screener":
     # ── Deep Dive Runner ─────────────────────────────────────────────────
     api_key = os.environ.get("ANTHROPIC_API_KEY")
 
+    # Build full ticker list from unfiltered master for dropdowns
+    _all_tickers_sorted = sorted(master["ticker"].tolist())
+    _ticker_label_map = {}
+    for _t in _all_tickers_sorted:
+        _tdata = st.session_state.all_data.get(_t, {})
+        _tinfo = _tdata.get("info", {})
+        _comp = _tdata.get("company", _tinfo.get("longName", _tinfo.get("shortName", "")))
+        _ticker_label_map[_t] = f"{_t} — {_comp}" if _comp else _t
+    _ticker_labels = [_ticker_label_map[_t] for _t in _all_tickers_sorted]
+
     with st.expander("🔬 Run Deep Dive Analysis", expanded=False):
-        dd_mode = st.radio(
-            "Analyze:",
-            ["Individual stock", "Select stocks", "Buy candidates"],
-            horizontal=True,
-            key="dd_batch_mode",
-        )
-
-        dd_targets = []
-        if dd_mode == "Individual stock":
-            dd_pick = st.selectbox(
-                "Select stock",
-                options=df["ticker"].tolist(),
-                index=None,
-                key="dd_individual_pick",
-                placeholder="Type or select a ticker...",
+        if master is None or master.empty:
+            st.warning("Stock data not yet loaded — please wait for the screener to initialize.")
+        else:
+            dd_mode = st.radio(
+                "Analyze:",
+                ["Individual stock", "Select stocks", "Buy candidates"],
+                horizontal=True,
+                key="dd_batch_mode",
             )
-            if dd_pick:
-                dd_targets = [dd_pick]
-        elif dd_mode == "Select stocks":
-            dd_picks = st.multiselect(
-                "Select stocks (up to 20)",
-                options=sorted(df["ticker"].tolist()),
-                max_selections=20,
-                key="dd_multi_picks",
-            )
-            dd_targets = dd_picks
-        else:  # Buy candidates
-            buy_df = df[(df["quality_rating"] == "Above Bar") & (df[mos_col].fillna(-999) > 20)]
-            dd_targets = buy_df["ticker"].tolist()
-            st.caption(f"{len(dd_targets)} Buy candidates found")
 
-        # Show which already have deep dives cached
-        dd_cache = st.session_state.deep_dive_cache
-        already_done = [t for t in dd_targets if t in dd_cache]
-        need_run = [t for t in dd_targets if t not in dd_cache]
+            dd_targets = []
+            if dd_mode == "Individual stock":
+                dd_pick_label = st.selectbox(
+                    "Select stock",
+                    options=_ticker_labels,
+                    index=None,
+                    key="dd_individual_pick",
+                    placeholder="Type ticker or company name...",
+                )
+                if dd_pick_label:
+                    dd_pick = dd_pick_label.split(" — ")[0].strip()
+                    dd_targets = [dd_pick]
+            elif dd_mode == "Select stocks":
+                dd_picks_labels = st.multiselect(
+                    "Select stocks (up to 20)",
+                    options=_ticker_labels,
+                    max_selections=20,
+                    key="dd_multi_picks",
+                )
+                dd_targets = [lbl.split(" — ")[0].strip() for lbl in dd_picks_labels]
+            else:  # Buy candidates
+                _q75 = master["composite_score"].quantile(0.75)
+                buy_df = master[
+                    (master["quality_rating"] == "Above Bar")
+                    & (master["margin_of_safety"].fillna(-999) > 0)
+                    & (master["composite_score"].fillna(0) >= _q75)
+                ].sort_values("composite_score", ascending=False)
+                dd_targets = buy_df["ticker"].tolist()
+                st.caption(
+                    f"{len(dd_targets)} stocks qualify as Buy Candidates "
+                    f"(Above Bar quality + positive margin of safety + top 25% composite score)"
+                )
 
-        if dd_targets:
-            info_parts = []
-            if need_run:
+            # Show which already have deep dives cached
+            dd_cache = st.session_state.deep_dive_cache
+            already_done = [t for t in dd_targets if t in dd_cache]
+            need_run = [t for t in dd_targets if t not in dd_cache]
+
+            if dd_targets:
+                info_parts = []
+                if need_run:
+                    est_cost = len(need_run) * _API_COSTS["deep_dive"]
+                    est_time = len(need_run) * 75
+                    info_parts.append(
+                        f"**{len(need_run)}** to analyze (~${est_cost:.2f}, ~{est_time // 60}m {est_time % 60}s)"
+                    )
+                if already_done:
+                    info_parts.append(f"**{len(already_done)}** already cached")
+                st.info(" | ".join(info_parts))
+
+            # Warning for large batches
+            if len(need_run) > 20:
                 est_cost = len(need_run) * _API_COSTS["deep_dive"]
-                est_time = len(need_run) * 75
-                info_parts.append(
-                    f"**{len(need_run)}** to analyze (~${est_cost:.2f}, ~{est_time // 60}m {est_time % 60}s)"
+                st.warning(
+                    f"This will analyze {len(need_run)} stocks at an estimated cost "
+                    f"of ${est_cost:.2f}. Use the buttons below to confirm."
                 )
-            if already_done:
-                info_parts.append(f"**{len(already_done)}** already cached")
-            st.info(" | ".join(info_parts))
 
-        # Warning for large batches
-        if len(need_run) > 20:
-            est_cost = len(need_run) * _API_COSTS["deep_dive"]
-            st.warning(
-                f"This will analyze {len(need_run)} stocks at an estimated cost "
-                f"of ${est_cost:.2f}. Use the buttons below to confirm."
-            )
-
-        bc1, bc2 = st.columns(2)
-        with bc1:
-            dd_run_batch = st.button(
-                f"Run Deep Dive ({len(need_run)} stock{'s' if len(need_run) != 1 else ''})",
-                type="primary",
-                disabled=not need_run or not api_key,
-                key="dd_batch_run",
-            )
-        with bc2:
-            dd_force_all = st.button(
-                f"Re-run All ({len(dd_targets)} stock{'s' if len(dd_targets) != 1 else ''})",
-                disabled=not dd_targets or not api_key,
-                key="dd_batch_rerun",
-            )
-
-        if dd_run_batch or dd_force_all:
-            run_list = dd_targets if dd_force_all else need_run
-            progress = st.progress(0, text="Starting deep dive batch...")
-            succeeded = 0
-            failed = 0
-            for i, t in enumerate(run_list):
-                progress.progress(
-                    (i + 1) / len(run_list),
-                    text=f"Analyzing {t} ({i + 1}/{len(run_list)})...",
+            bc1, bc2 = st.columns(2)
+            with bc1:
+                dd_run_batch = st.button(
+                    f"Run Deep Dive ({len(need_run)} stock{'s' if len(need_run) != 1 else ''})",
+                    type="primary",
+                    disabled=not need_run or not api_key,
+                    key="dd_batch_run",
                 )
-                result = _run_dd_for_ticker(t, api_key, force_refresh=dd_force_all)
-                if result:
-                    succeeded += 1
-                else:
-                    failed += 1
+            with bc2:
+                dd_force_all = st.button(
+                    f"Re-run All ({len(dd_targets)} stock{'s' if len(dd_targets) != 1 else ''})",
+                    disabled=not dd_targets or not api_key,
+                    key="dd_batch_rerun",
+                )
 
-            progress.empty()
-            msg = f"Completed deep dive for {succeeded} stock{'s' if succeeded != 1 else ''}."
-            if failed:
-                msg += f" {failed} failed."
-            st.success(msg)
-            st.session_state.selected_for_deepdive = run_list
-            st.rerun()
+            if dd_run_batch or dd_force_all:
+                run_list = dd_targets if dd_force_all else need_run
+                progress = st.progress(0, text="Starting deep dive batch...")
+                succeeded = 0
+                failed = 0
+                for i, t in enumerate(run_list):
+                    progress.progress(
+                        (i + 1) / len(run_list),
+                        text=f"Analyzing {t} ({i + 1}/{len(run_list)})...",
+                    )
+                    result = _run_dd_for_ticker(t, api_key, force_refresh=dd_force_all)
+                    if result:
+                        succeeded += 1
+                    else:
+                        failed += 1
+
+                progress.empty()
+                msg = f"Completed deep dive for {succeeded} stock{'s' if succeeded != 1 else ''}."
+                if failed:
+                    msg += f" {failed} failed."
+                st.success(msg)
+                st.session_state.selected_for_deepdive = run_list
+                st.rerun()
+
+            # Debug info
+            if os.environ.get("DEBUG", "").lower() == "true":
+                with st.expander("🔧 Debug Info", expanded=False):
+                    st.text(f"Total stocks loaded: {len(master)}")
+                    st.text(f"Columns: {master.columns.tolist()}")
+                    st.text(f"Quality rating values:\n{master['quality_rating'].value_counts().to_string()}")
+                    mos_s = master["margin_of_safety"].dropna()
+                    st.text(f"Margin of safety range: {mos_s.min():.1f} to {mos_s.max():.1f}")
+                    _q75_dbg = master["composite_score"].quantile(0.75)
+                    _bc_dbg = master[
+                        (master["quality_rating"] == "Above Bar")
+                        & (master["margin_of_safety"].fillna(-999) > 0)
+                        & (master["composite_score"].fillna(0) >= _q75_dbg)
+                    ]
+                    st.text(f"Buy candidates found: {len(_bc_dbg)}")
 
     # Ticker selection for detail view
     sel = st.selectbox(
