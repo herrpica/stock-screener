@@ -10,34 +10,90 @@ SEC EDGAR filing fetcher and Claude-powered narrative analysis.
 import os
 import re
 import json
+import time
 import logging
-from datetime import datetime
+import pathlib
+from datetime import datetime, timezone
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import anthropic
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 MODEL = "claude-sonnet-4-20250514"
 MAX_TOKENS = 4096
 
-# SEC EDGAR requires a descriptive User-Agent with contact info
-_DEFAULT_UA = "StockScreener/1.0 (stock-screener-app)"
+# SEC EDGAR requires: "AppName/Version email@domain.com" (no parentheses)
+SEC_EMAIL = os.getenv("SEC_USER_AGENT_EMAIL", "stockscreener@example.com")
+
+_last_request_time = 0.0
 
 
-def _get_user_agent() -> str:
-    """Get SEC User-Agent from env or use default."""
-    return os.environ.get("SEC_USER_AGENT", _DEFAULT_UA)
-
-
-def _sec_headers() -> dict:
-    return {
-        "User-Agent": _get_user_agent(),
+def _create_edgar_session() -> requests.Session:
+    """Create a requests session configured for SEC EDGAR compliance."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": f"StockScreener/1.0 {SEC_EMAIL}",
         "Accept-Encoding": "gzip, deflate",
-    }
+    })
+    retry = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    return session
+
+
+EDGAR_SESSION = _create_edgar_session()
+
+
+def _rate_limited_get(url: str, timeout: int = 30) -> requests.Response:
+    """GET with rate limiting (~6 req/sec) and per-host Host header."""
+    global _last_request_time
+    elapsed = time.time() - _last_request_time
+    if elapsed < 0.15:
+        time.sleep(0.15 - elapsed)
+    resp = EDGAR_SESSION.get(url, timeout=timeout)
+    _last_request_time = time.time()
+    return resp
 
 
 # ── CIK Lookup ────────────────────────────────────────────────────────────
+
+_CACHE_DIR = pathlib.Path(__file__).parent.parent / ".cache"
+_TICKERS_CACHE_FILE = _CACHE_DIR / "company_tickers.json"
+_TICKERS_MAX_AGE_SECS = 86400  # 24 hours
+
+
+def _load_company_tickers() -> dict:
+    """Load company tickers JSON, using a local file cache (refreshed every 24h)."""
+    # Try local cache first
+    if _TICKERS_CACHE_FILE.exists():
+        age = time.time() - _TICKERS_CACHE_FILE.stat().st_mtime
+        if age < _TICKERS_MAX_AGE_SECS:
+            with open(_TICKERS_CACHE_FILE, "r") as f:
+                return json.load(f)
+
+    # Fetch fresh from SEC
+    url = "https://www.sec.gov/files/company_tickers.json"
+    resp = _rate_limited_get(url, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Save to cache
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(_TICKERS_CACHE_FILE, "w") as f:
+        json.dump(data, f)
+
+    return data
+
 
 _CIK_CACHE: dict = {}
 
@@ -52,10 +108,7 @@ def get_cik(ticker: str) -> str | None:
         return _CIK_CACHE[ticker]
 
     try:
-        url = "https://www.sec.gov/files/company_tickers.json"
-        resp = requests.get(url, headers=_sec_headers(), timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+        data = _load_company_tickers()
 
         for entry in data.values():
             t = entry.get("ticker", "").upper()
@@ -91,7 +144,7 @@ def get_recent_filings(
 
     try:
         url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-        resp = requests.get(url, headers=_sec_headers(), timeout=15)
+        resp = _rate_limited_get(url, timeout=15)
         resp.raise_for_status()
         data = resp.json()
 
@@ -138,7 +191,7 @@ def get_filing_document(filing: dict, max_chars: int = 100_000) -> str | None:
         return None
 
     try:
-        resp = requests.get(url, headers=_sec_headers(), timeout=30)
+        resp = _rate_limited_get(url, timeout=30)
         resp.raise_for_status()
         text = resp.text
 
@@ -221,8 +274,59 @@ def extract_section(
 
 # ── Claude Analysis Functions ─────────────────────────────────────────────
 
-def _call_claude(system: str, user_prompt: str, api_key: str) -> dict | None:
-    """Helper to call Claude and parse JSON response."""
+def _extract_json(text: str, call_name: str = "SEC Claude call") -> dict:
+    """Robust JSON extraction with multiple fallback strategies."""
+    text = text.strip()
+
+    # Strategy 1: direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 2: strip markdown code fences
+    fence_pattern = re.compile(r"```(?:json)?\s*\n?(.*?)\n?\s*```", re.DOTALL)
+    fence_match = fence_pattern.search(text)
+    if fence_match:
+        try:
+            return json.loads(fence_match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 3: extract first { ... last }
+    brace_start = text.find("{")
+    brace_end = text.rfind("}")
+    if brace_start >= 0 and brace_end > brace_start:
+        try:
+            return json.loads(text[brace_start:brace_end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 4: array responses [ ... ]
+    bracket_start = text.find("[")
+    bracket_end = text.rfind("]")
+    if bracket_start >= 0 and bracket_end > bracket_start:
+        try:
+            arr = json.loads(text[bracket_start:bracket_end + 1])
+            return {"items": arr}
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 5: walk backwards to find last valid closing brace
+    if brace_start >= 0:
+        for i in range(len(text) - 1, brace_start, -1):
+            if text[i] == "}":
+                try:
+                    return json.loads(text[brace_start:i + 1])
+                except json.JSONDecodeError:
+                    continue
+
+    logger.warning(f"{call_name}: All JSON extraction strategies failed. Raw: {text[:300]}")
+    return {"error": f"JSON parse failed for {call_name}", "raw": text[:500]}
+
+
+def _call_claude(system: str, user_prompt: str, api_key: str, call_name: str = "SEC analysis") -> dict | None:
+    """Helper to call Claude and parse JSON response with robust extraction."""
     try:
         client = anthropic.Anthropic(api_key=api_key)
         response = client.messages.create(
@@ -231,19 +335,7 @@ def _call_claude(system: str, user_prompt: str, api_key: str) -> dict | None:
             system=system,
             messages=[{"role": "user", "content": user_prompt}],
         )
-        text = response.content[0].text.strip()
-
-        # Handle markdown code fences
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.strip()
-
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        logger.warning(f"Failed to parse Claude response: {e}")
-        return {"error": f"JSON parse error: {e}"}
+        return _extract_json(response.content[0].text, call_name)
     except anthropic.APIError as e:
         logger.warning(f"Anthropic API error: {e}")
         return {"error": f"API error: {e}"}
@@ -263,7 +355,11 @@ def analyze_10k_narrative(
     management_tone, forward_guidance, notable_changes
     """
     system = """You are an expert SEC filing analyst. Analyze the 10-K filing text
-for investment-relevant signals. Return ONLY valid JSON (no markdown, no code fences):
+for investment-relevant signals.
+
+CRITICAL: Your response must be ONLY valid JSON. No explanatory text before or after.
+No markdown code fences. Start with { and end with }. Complete the entire structure.
+
 {
   "overall_sentiment": "positive|neutral|cautious|negative",
   "red_flags": [
@@ -310,7 +406,7 @@ Rules:
         f"10-K Filing Excerpts:\n\n{''.join(sections_text[:30000])}"
     )
 
-    return _call_claude(system, user_prompt, api_key)
+    return _call_claude(system, user_prompt, api_key, call_name="10-K narrative")
 
 
 def analyze_proxy_statement(
@@ -324,7 +420,11 @@ def analyze_proxy_statement(
     shareholder_concerns, related_party_flags
     """
     system = """You are an expert proxy statement analyst. Analyze the DEF 14A filing
-for corporate governance and compensation signals. Return ONLY valid JSON:
+for corporate governance and compensation signals.
+
+CRITICAL: Your response must be ONLY valid JSON. No explanatory text before or after.
+No markdown code fences. Start with { and end with }. Complete the entire structure.
+
 {
   "executive_compensation": {
     "ceo_total_comp": "approximate total",
@@ -353,7 +453,7 @@ for corporate governance and compensation signals. Return ONLY valid JSON:
         f"Proxy Statement (DEF 14A) Excerpts:\n\n{filing_text[:30000]}"
     )
 
-    return _call_claude(system, user_prompt, api_key)
+    return _call_claude(system, user_prompt, api_key, call_name="proxy statement")
 
 
 def analyze_recent_8k(
@@ -368,7 +468,11 @@ def analyze_recent_8k(
     Returns dict with: material_events, overall_signal, event_timeline
     """
     system = """You are an expert at analyzing 8-K material event filings.
-Analyze the recent 8-K filings and identify material events. Return ONLY valid JSON:
+Analyze the recent 8-K filings and identify material events.
+
+CRITICAL: Your response must be ONLY valid JSON. No explanatory text before or after.
+No markdown code fences. Start with { and end with }. Complete the entire structure.
+
 {
   "material_events": [
     {
@@ -393,7 +497,7 @@ Analyze the recent 8-K filings and identify material events. Return ONLY valid J
         f"Recent 8-K Filings:\n{combined[:30000]}"
     )
 
-    return _call_claude(system, user_prompt, api_key)
+    return _call_claude(system, user_prompt, api_key, call_name="8-K analysis")
 
 
 def check_management_credibility(
@@ -409,7 +513,11 @@ def check_management_credibility(
     """
     system = """You are an expert at evaluating management credibility by comparing
 what management said they would do (in prior filings) vs what actually happened
-(in current filings). Return ONLY valid JSON:
+(in current filings).
+
+CRITICAL: Your response must be ONLY valid JSON. No explanatory text before or after.
+No markdown code fences. Start with { and end with }. Complete the entire structure.
+
 {
   "credibility_score": 75,
   "promises_kept": [
@@ -441,7 +549,7 @@ Rules:
     else:
         user_prompt += "(No prior 10-K available — assess internal consistency only)"
 
-    return _call_claude(system, user_prompt, api_key)
+    return _call_claude(system, user_prompt, api_key, call_name="management credibility")
 
 
 def get_full_sec_analysis(
@@ -538,3 +646,26 @@ def get_full_sec_analysis(
     result["overall_sec_flag"] = worst
 
     return result
+
+
+# ── Diagnostic Test ──────────────────────────────────────────────────────
+
+def test_edgar_connection():
+    """Test connectivity to SEC EDGAR endpoints."""
+    print(f"User-Agent: {EDGAR_SESSION.headers['User-Agent']}")
+    print(f"SEC_EMAIL:  {SEC_EMAIL}")
+    print()
+    endpoints = [
+        ("EDGAR Search", "https://efts.sec.gov/LATEST/search-index?q=AMZN&dateRange=custom&startdt=2024-01-01&enddt=2024-12-31&forms=10-K"),
+        ("Submissions", "https://data.sec.gov/submissions/CIK0001018724.json"),
+        ("Company Facts", "https://data.sec.gov/api/xbrl/companyfacts/CIK0001018724.json"),
+    ]
+    for name, url in endpoints:
+        try:
+            resp = _rate_limited_get(url, timeout=15)
+            print(f"{name}: {resp.status_code} ({len(resp.content)} bytes)")
+            if resp.status_code != 200:
+                print(f"  Headers sent: {resp.request.headers}")
+                print(f"  Response: {resp.text[:200]}")
+        except Exception as e:
+            print(f"{name}: ERROR - {e}")

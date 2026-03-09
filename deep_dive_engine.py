@@ -159,13 +159,69 @@ def estimate_deep_dive_cost() -> str:
     )
 
 
+def _extract_json(text: str, call_name: str) -> dict:
+    """Robustly extract JSON from a Claude response.
+
+    Handles markdown fences, preamble text, truncation, etc.
+    """
+    if not text:
+        raise ValueError(f"{call_name}: empty response")
+
+    text = text.strip()
+
+    # Strategy 1 — direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 2 — strip markdown code fences
+    fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+    if fence_match:
+        try:
+            return json.loads(fence_match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 3 — first { to last }
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        try:
+            return json.loads(text[first_brace : last_brace + 1])
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 4 — array responses [ … ]
+    first_bracket = text.find("[")
+    last_bracket = text.rfind("]")
+    if first_bracket != -1 and last_bracket > first_bracket:
+        try:
+            return json.loads(text[first_bracket : last_bracket + 1])
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 5 — walk backwards to find the last valid closing brace
+    if first_brace is not None and first_brace != -1:
+        for i in range(len(text) - 1, first_brace, -1):
+            if text[i] == "}":
+                try:
+                    return json.loads(text[first_brace : i + 1])
+                except json.JSONDecodeError:
+                    continue
+
+    preview = text[:500]
+    raise ValueError(f"{call_name}: could not extract JSON.\nPreview: {preview}")
+
+
 def _call_claude(
     system: str,
     user_prompt: str,
     api_key: str,
     max_tokens: int = MAX_TOKENS,
+    call_name: str = "Claude call",
 ) -> dict:
-    """Call Claude and parse JSON response."""
+    """Call Claude and robustly parse JSON response."""
     try:
         client = anthropic.Anthropic(api_key=api_key)
         response = client.messages.create(
@@ -174,24 +230,15 @@ def _call_claude(
             system=system,
             messages=[{"role": "user", "content": user_prompt}],
         )
-        text = response.content[0].text.strip()
-
-        # Handle markdown code fences
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.strip()
-
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        logger.warning(f"Failed to parse Claude response: {e}")
-        return {"error": f"JSON parse error: {e}"}
+        return _extract_json(response.content[0].text, call_name)
+    except (ValueError, json.JSONDecodeError) as e:
+        logger.warning(f"{call_name} JSON parse failed: {e}")
+        return {"error": str(e)}
     except anthropic.APIError as e:
-        logger.warning(f"Anthropic API error: {e}")
+        logger.warning(f"{call_name} API error: {e}")
         return {"error": f"API error: {e}"}
     except Exception as e:
-        logger.warning(f"Claude call failed: {e}")
+        logger.warning(f"{call_name} failed: {e}")
         return {"error": f"Analysis failed: {e}"}
 
 
@@ -407,7 +454,8 @@ You have been asked to assess the fundamental quality of this business based
 solely on its public filings. Be direct, skeptical, and specific. Flag anything
 that concerns you.
 
-Return ONLY valid JSON (no markdown, no code fences) in the exact structure specified."""
+CRITICAL: Your response must be ONLY valid JSON. No explanatory text before or after.
+No markdown code fences. Start with { and end with }. Complete the entire structure."""
 
 
 _CALL1_SCHEMA = """{
@@ -473,7 +521,8 @@ def _run_call_1(
         f"{_CALL1_SCHEMA}"
     )
 
-    return _call_claude(_CALL1_SYSTEM, user_prompt, api_key)
+    return _call_claude(_CALL1_SYSTEM, user_prompt, api_key,
+                        max_tokens=3000, call_name="Call 1 (Business Quality)")
 
 
 # ── Call 2: Quantitative Metric Reconciliation ────────────────────────────
@@ -483,7 +532,8 @@ quantitative metrics calculated from a company's reported financials AND the
 narrative content of their SEC filings. Your job is to identify where the numbers
 are misleading — in either direction — and recommend specific adjustments.
 
-Return ONLY valid JSON (no markdown, no code fences) in the exact structure specified."""
+CRITICAL: Your response must be ONLY valid JSON. No explanatory text before or after.
+No markdown code fences. Start with { and end with }. Complete the entire structure."""
 
 
 _CALL2_SCHEMA = """{
@@ -581,7 +631,8 @@ def _run_call_2(
         f"Return ONLY valid JSON in this structure:\n{_CALL2_SCHEMA}"
     )
 
-    return _call_claude(_CALL2_SYSTEM, user_prompt, api_key)
+    return _call_claude(_CALL2_SYSTEM, user_prompt, api_key,
+                        max_tokens=4000, call_name="Call 2 (Metric Reconciliation)")
 
 
 # ── Call 3: Forward Looking Analysis ──────────────────────────────────────
@@ -590,7 +641,8 @@ _CALL3_SYSTEM = """You are a growth equity analyst focused on where a business w
 in 3-5 years. Based on the company's own disclosures, assess the trajectory of
 this business and identify catalysts and risks that backward-looking metrics miss.
 
-Return ONLY valid JSON (no markdown, no code fences) in the exact structure specified."""
+CRITICAL: Your response must be ONLY valid JSON. No explanatory text before or after.
+No markdown code fences. Start with { and end with }. Complete the entire structure."""
 
 
 _CALL3_SCHEMA = """{
@@ -665,7 +717,8 @@ def _run_call_3(
         f"Analyze the forward trajectory. Return ONLY valid JSON:\n{_CALL3_SCHEMA}"
     )
 
-    return _call_claude(_CALL3_SYSTEM, user_prompt, api_key)
+    return _call_claude(_CALL3_SYSTEM, user_prompt, api_key,
+                        max_tokens=3000, call_name="Call 3 (Forward Analysis)")
 
 
 # ── Call 4: Investment Thesis Synthesis ────────────────────────────────────
@@ -754,7 +807,8 @@ def _run_call_4(
         f"Return ONLY valid JSON:\n{_CALL4_SCHEMA}"
     )
 
-    return _call_claude(_CALL4_SYSTEM, user_prompt, api_key)
+    return _call_claude(_CALL4_SYSTEM, user_prompt, api_key,
+                        max_tokens=4000, call_name="Call 4 (Thesis Synthesis)")
 
 
 # ── DCF Recalculation ─────────────────────────────────────────────────────
@@ -997,7 +1051,11 @@ def run_deep_dive(
 
     def _progress(step: int):
         if on_progress:
-            on_progress(step, STEPS[step])
+            try:
+                label = STEPS[step] if step < len(STEPS) else "Completing..."
+                on_progress(step, label)
+            except Exception as e:
+                logger.debug(f"Progress update failed (non-critical): {e}")
 
     # Step 0: Assemble documents
     _progress(0)
@@ -1005,13 +1063,49 @@ def run_deep_dive(
         documents = fetch_all_documents(ticker)
 
     if not documents.get("documents_found"):
-        return {"error": f"No SEC documents found for {ticker}."}
+        # Fallback: build basic context from yfinance data so analysis can proceed
+        logger.info(f"No SEC documents for {ticker} — using yfinance data fallback.")
+        fallback_lines = [
+            f"Company: {company_name}",
+            f"Sector: {sector}",
+            f"Quality Rating: {quality_rating_str}",
+        ]
+        for k, v in current_valuation.items():
+            fallback_lines.append(f"{k}: {v}")
+        for k, v in current_scores.items():
+            fallback_lines.append(f"{k}: {v}")
+        fallback_text = "\n".join(fallback_lines)
+        documents = {
+            "annual_report_text": f"[SEC filings unavailable — analysis based on quantitative data]\n{fallback_text}",
+            "quarterly_update_text": None,
+            "earnings_call_text": None,
+            "proxy_text": None,
+            "prior_year_mda": None,
+            "documents_found": ["yfinance_fallback"],
+        }
+
+    partial_failures = []
 
     # Step 1: Business Quality Assessment
     _progress(1)
     call1 = _run_call_1(ticker, company_name, sector, documents, key)
     if "error" in call1:
-        return {"error": f"Call 1 (Business Quality) failed: {call1['error']}"}
+        logger.warning(f"Call 1 failed for {ticker}: {call1['error']}")
+        partial_failures.append(f"Call 1 (Business Quality): {call1['error']}")
+        call1 = {
+            "overall_business_quality_score": 50,
+            "business_model_clarity": 50,
+            "competitive_moat_assessment": {"moat_exists": False, "moat_type": "none",
+                                            "moat_durability": "none", "evidence": "Analysis failed"},
+            "revenue_quality": {"score": 50, "notes": "Analysis failed"},
+            "earnings_quality": {"score": 50, "concerns": [], "one_time_items_detected": False,
+                                 "gaap_vs_reality_gap": "minimal"},
+            "ai_and_technology_position": {"ai_as_opportunity": False, "ai_as_threat": False,
+                                           "company_ai_initiatives": [], "disruption_risk_level": "none"},
+            "key_business_risks": [],
+            "hidden_strengths": [], "hidden_weaknesses": [],
+            "parse_error": True,
+        }
 
     # Step 2: Quantitative Metric Reconciliation
     _progress(2)
@@ -1020,13 +1114,45 @@ def run_deep_dive(
         current_quality_rating, documents, key,
     )
     if "error" in call2:
-        return {"error": f"Call 2 (Metric Reconciliation) failed: {call2['error']}"}
+        logger.warning(f"Call 2 failed for {ticker}: {call2['error']}")
+        partial_failures.append(f"Call 2 (Metric Reconciliation): {call2['error']}")
+        call2 = {
+            "score_adjustments": {
+                "quality_score": {"adjustment": 0, "reasoning": "Analysis failed"},
+                "growth_score": {"adjustment": 0, "reasoning": "Analysis failed"},
+                "value_score": {"adjustment": 0, "reasoning": "Analysis failed"},
+                "sentiment_score": {"adjustment": 0, "reasoning": "Analysis failed"},
+            },
+            "intrinsic_value_adjustments": {
+                "growth_rate_adjustment": 0, "reasoning": "Using base calculations",
+                "earnings_base_adjustment_pct": 0, "earnings_base_reasoning": "N/A",
+                "discount_rate_adjustment": 0, "discount_rate_reasoning": "N/A",
+            },
+            "quality_rating_adjustment": {"suggested_rating": "No Change", "reasoning": "Analysis failed"},
+            "management_credibility": {"score": 50, "credibility_assessment": "unknown"},
+            "red_flags": [], "positive_revisions": [],
+            "parse_error": True,
+        }
 
     # Step 3: Forward Looking Analysis
     _progress(3)
     call3 = _run_call_3(ticker, company_name, sector, call1, documents, key)
     if "error" in call3:
-        return {"error": f"Call 3 (Forward Analysis) failed: {call3['error']}"}
+        logger.warning(f"Call 3 failed for {ticker}: {call3['error']}")
+        partial_failures.append(f"Call 3 (Forward Analysis): {call3['error']}")
+        call3 = {
+            "growth_catalysts": [], "growth_headwinds": [],
+            "margin_trajectory": {"direction": "stable", "reasoning": "Analysis failed", "confidence": "low"},
+            "revenue_trajectory": {"direction": "stable", "reasoning": "Analysis failed", "confidence": "low"},
+            "competitive_position_trend": "stable",
+            "three_year_earnings_power_estimate": {
+                "base_case_growth_rate": current_valuation.get("growth_rate_used", 0.05),
+                "bull_case_growth_rate": current_valuation.get("growth_rate_used", 0.05) + 0.03,
+                "bear_case_growth_rate": current_valuation.get("growth_rate_used", 0.05) - 0.03,
+                "key_assumptions": ["Using base calculations — forward analysis unavailable"],
+            },
+            "parse_error": True,
+        }
 
     # Compute adjusted IV for Call 4 context
     iv_adj = call2.get("intrinsic_value_adjustments", {})
@@ -1057,7 +1183,21 @@ def run_deep_dive(
         orig_price, preview_iv, preview_mos, key,
     )
     if "error" in call4:
-        return {"error": f"Call 4 (Thesis Synthesis) failed: {call4['error']}"}
+        logger.warning(f"Call 4 failed for {ticker}: {call4['error']}")
+        partial_failures.append(f"Call 4 (Thesis Synthesis): {call4['error']}")
+        call4 = {
+            "recommendation": "Hold",
+            "conviction_level": "low",
+            "one_line_thesis": "Investment thesis unavailable — analysis partially failed.",
+            "bull_case": {"narrative": "N/A", "key_assumptions": [], "upside_to_intrinsic_value_pct": 0},
+            "base_case": {"narrative": "N/A", "key_assumptions": [], "expected_return_12_month_pct": 0},
+            "bear_case": {"narrative": "N/A", "key_risks": [], "downside_pct": 0},
+            "what_would_change_thesis": [],
+            "ideal_entry_price": orig_price or 0,
+            "position_sizing_suggestion": "avoid",
+            "memo_summary": "Deep dive analysis partially failed. Review individual call results.",
+            "parse_error": True,
+        }
 
     # Step 5: Assemble final result
     _progress(5)
@@ -1073,6 +1213,9 @@ def run_deep_dive(
         documents_found=documents.get("documents_found", []),
         discount_rate=discount_rate,
     )
+
+    if partial_failures:
+        result["partial_failures"] = partial_failures
 
     # Cache result
     save_deep_dive_cache(ticker, result)

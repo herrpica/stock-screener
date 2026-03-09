@@ -52,7 +52,7 @@ A Streamlit-based stock screening application that scores, rates, and values all
    ```
    Edit `.env` and add:
    - `ANTHROPIC_API_KEY` — your Anthropic API key (required for scenario analysis and SEC intelligence)
-   - `SEC_USER_AGENT` — your name and email for SEC EDGAR compliance (recommended)
+   - `SEC_USER_AGENT_EMAIL` — your email for SEC EDGAR compliance (recommended)
 
 3. **Run the app:**
    ```bash

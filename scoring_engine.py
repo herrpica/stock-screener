@@ -303,3 +303,122 @@ def score_all_stocks(
         "sector_rank", "sector_total",
     ]
     return df[out_cols].sort_values("composite_score", ascending=False).reset_index(drop=True)
+
+
+# ── Methodology validation via XBRL backtest ────────────────────────────────
+
+def backtest_scoring_methodology(
+    tickers: list[str],
+    all_ticker_data: dict,
+    xbrl_data: dict,
+    start_year: int = 2015,
+    end_year: int = 2022,
+) -> pd.DataFrame:
+    """Compute historical scores and compare to 3-year forward EPS growth.
+
+    For each year in [start_year, end_year], compute a simplified composite
+    score using only XBRL data available at that point, then compare to actual
+    3-year forward EPS CAGR.
+
+    Returns DataFrame with:
+        ticker, year, score_quartile (1-4), forward_eps_growth_3yr,
+        forward_return_quartile
+    """
+    rows = []
+
+    for ticker in tickers:
+        xbrl = xbrl_data.get(ticker)
+        if not xbrl or not xbrl.get("available"):
+            continue
+
+        annual = xbrl["annual_data"]
+        if "net_income" not in annual.columns or "revenue" not in annual.columns:
+            continue
+
+        ni = annual["net_income"].dropna()
+        rev = annual["revenue"].dropna()
+
+        for year in range(start_year, end_year + 1):
+            # Need at least 3 years of history before this year
+            ni_avail = ni[ni.index <= year]
+            rev_avail = rev[rev.index <= year]
+
+            if len(ni_avail) < 3 or len(rev_avail) < 3:
+                continue
+
+            # Simple score: earnings growth momentum + margin stability
+            score = 50.0
+
+            # Earnings growth (3yr CAGR up to this year)
+            start_ni = ni_avail.iloc[-3] if len(ni_avail) >= 3 else ni_avail.iloc[0]
+            end_ni = ni_avail.iloc[-1]
+            if start_ni > 0 and end_ni > 0:
+                ni_years = min(3, len(ni_avail) - 1)
+                if ni_years > 0:
+                    cagr = (end_ni / start_ni) ** (1 / ni_years) - 1
+                    score += min(25, max(-15, cagr * 100))
+
+            # Revenue growth
+            start_rev = rev_avail.iloc[-3] if len(rev_avail) >= 3 else rev_avail.iloc[0]
+            end_rev = rev_avail.iloc[-1]
+            if start_rev > 0 and end_rev > 0:
+                rev_years = min(3, len(rev_avail) - 1)
+                if rev_years > 0:
+                    rev_cagr = (end_rev / start_rev) ** (1 / rev_years) - 1
+                    score += min(15, max(-10, rev_cagr * 80))
+
+            # Margin stability
+            if "net_margin" in annual.columns:
+                margins = annual["net_margin"].dropna()
+                margins = margins[margins.index <= year]
+                if len(margins) >= 2:
+                    margin_std = margins.std()
+                    if margin_std < 0.03:
+                        score += 10
+                    elif margin_std > 0.15:
+                        score -= 10
+
+            score = max(0, min(100, score))
+
+            # Forward 3-year EPS growth (actual outcome)
+            future_ni = ni[ni.index > year]
+            future_ni = future_ni[future_ni.index <= year + 3]
+
+            if len(future_ni) >= 2 and end_ni > 0:
+                fwd_val = future_ni.iloc[-1]
+                fwd_years = future_ni.index[-1] - year
+                if fwd_val > 0 and fwd_years > 0:
+                    fwd_growth = (fwd_val / end_ni) ** (1 / fwd_years) - 1
+                else:
+                    fwd_growth = None
+            else:
+                fwd_growth = None
+
+            rows.append({
+                "ticker": ticker,
+                "year": year,
+                "historical_score": round(score, 1),
+                "forward_eps_growth_3yr": round(fwd_growth, 4) if fwd_growth is not None else None,
+            })
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+
+    # Assign score quartiles (1=best, 4=worst)
+    df["score_quartile"] = pd.qcut(
+        df["historical_score"], 4, labels=[4, 3, 2, 1], duplicates="drop"
+    ).astype(float)
+
+    # Assign forward return quartiles where available
+    fwd_valid = df["forward_eps_growth_3yr"].notna()
+    if fwd_valid.sum() >= 4:
+        df.loc[fwd_valid, "forward_return_quartile"] = pd.qcut(
+            df.loc[fwd_valid, "forward_eps_growth_3yr"],
+            4, labels=[4, 3, 2, 1], duplicates="drop",
+        ).astype(float)
+    else:
+        df["forward_return_quartile"] = np.nan
+
+    return df

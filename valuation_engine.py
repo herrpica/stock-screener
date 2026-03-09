@@ -130,6 +130,129 @@ def calculate_intrinsic_value(
     return result
 
 
+def get_earnings_growth_rate(
+    ticker: str,
+    ticker_data: dict,
+    xbrl_result: dict | None = None,
+) -> dict:
+    """Calculate earnings growth using XBRL history when available.
+
+    Computes CAGR at 4yr, 7yr, 10yr horizons from XBRL net income.
+    Uses median of available CAGRs for robustness.
+    Falls back to _compute_earnings_growth() if XBRL unavailable.
+
+    Returns dict with:
+        growth_rate: float (the recommended rate)
+        cagr_4yr, cagr_7yr, cagr_10yr: float or None
+        trend: "accelerating" | "decelerating" | "stable"
+        profitable_pct: float (0-1)
+        recession_resilience: dict (from recession_resilience_score)
+        data_source: "xbrl" | "yfinance"
+        horizons_used: int
+    """
+    result = {
+        "growth_rate": None,
+        "cagr_4yr": None,
+        "cagr_7yr": None,
+        "cagr_10yr": None,
+        "trend": "stable",
+        "profitable_pct": None,
+        "recession_resilience": None,
+        "data_source": "yfinance",
+        "horizons_used": 0,
+    }
+
+    # Try XBRL first
+    if xbrl_result and xbrl_result.get("available"):
+        annual = xbrl_result["annual_data"]
+        if "net_income" in annual.columns:
+            ni = annual["net_income"].dropna()
+            if len(ni) >= 3:
+                result["data_source"] = "xbrl"
+                years = ni.index.tolist()
+                latest_year = max(years)
+                latest_val = ni[latest_year]
+
+                if latest_val <= 0:
+                    # Can't compute meaningful CAGR with negative latest
+                    pass
+                else:
+                    cagrs = []
+                    # 4-year CAGR
+                    target_4 = latest_year - 4
+                    candidates_4 = [y for y in years if y <= target_4]
+                    if candidates_4 and ni[max(candidates_4)] > 0:
+                        base_year = max(candidates_4)
+                        n = latest_year - base_year
+                        cagr = (latest_val / ni[base_year]) ** (1 / n) - 1
+                        result["cagr_4yr"] = round(max(-0.10, min(0.40, cagr)), 4)
+                        cagrs.append(result["cagr_4yr"])
+
+                    # 7-year CAGR
+                    target_7 = latest_year - 7
+                    candidates_7 = [y for y in years if y <= target_7]
+                    if candidates_7 and ni[max(candidates_7)] > 0:
+                        base_year = max(candidates_7)
+                        n = latest_year - base_year
+                        cagr = (latest_val / ni[base_year]) ** (1 / n) - 1
+                        result["cagr_7yr"] = round(max(-0.10, min(0.40, cagr)), 4)
+                        cagrs.append(result["cagr_7yr"])
+
+                    # 10-year CAGR
+                    target_10 = latest_year - 10
+                    candidates_10 = [y for y in years if y <= target_10]
+                    if candidates_10 and ni[max(candidates_10)] > 0:
+                        base_year = max(candidates_10)
+                        n = latest_year - base_year
+                        cagr = (latest_val / ni[base_year]) ** (1 / n) - 1
+                        result["cagr_10yr"] = round(max(-0.10, min(0.40, cagr)), 4)
+                        cagrs.append(result["cagr_10yr"])
+
+                    result["horizons_used"] = len(cagrs)
+
+                    if cagrs:
+                        # Use median of available CAGRs
+                        median_cagr = float(np.median(cagrs))
+                        result["growth_rate"] = round(
+                            max(-0.05, min(0.25, median_cagr)), 4
+                        )
+
+                    # Trend detection
+                    if result["cagr_4yr"] is not None and result["cagr_10yr"] is not None:
+                        diff = result["cagr_4yr"] - result["cagr_10yr"]
+                        if diff > 0.03:
+                            result["trend"] = "accelerating"
+                        elif diff < -0.03:
+                            result["trend"] = "decelerating"
+
+                # Profitable %
+                profitable_years = (ni > 0).sum()
+                result["profitable_pct"] = round(profitable_years / len(ni), 3)
+
+                # Recession resilience (lazy import to avoid circular)
+                try:
+                    from edgar_xbrl_fetcher import recession_resilience_score
+                    eps_col = "eps_diluted" if "eps_diluted" in annual.columns else None
+                    if eps_col is None:
+                        eps_col = "eps_basic" if "eps_basic" in annual.columns else None
+                    if eps_col:
+                        eps = annual[eps_col].dropna()
+                    else:
+                        eps = ni  # use net income as proxy
+                    result["recession_resilience"] = recession_resilience_score(eps)
+                except ImportError:
+                    pass
+
+    # Fall back to yfinance-based calculation
+    if result["growth_rate"] is None:
+        yf_rate = _compute_earnings_growth(ticker_data)
+        if yf_rate is not None:
+            result["growth_rate"] = yf_rate
+            result["data_source"] = "yfinance"
+
+    return result
+
+
 def calculate_all_valuations(
     all_ticker_data: dict,
     required_rate: float = 0.10,
